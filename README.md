@@ -13,3 +13,6 @@ A No-Limit Texas Hold'em training app: 7 AI players with distinct styles play ea
 
 ## Token policy
 All math runs locally at zero token cost. Claude is called only when the user asks, with compact inputs and capped outputs. See `.claude/agents/token-optimizer.md`.
+
+## Run it
+Open `app/index.html` in a browser (no build step). Run the engine checks with `node tests/sim.js`.
