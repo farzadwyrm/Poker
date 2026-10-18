@@ -112,11 +112,6 @@
   const COMBOS = [];
   for (let a = 0; a < 52; a++) for (let b = a + 1; b < 52; b++) COMBOS.push([a, b, PCT[handKey([a, b])]]);
   COMBOS.sort((x, y) => x[2] - y[2]);
-  function rangeSize(lim) {
-    let lo = 0, hi = COMBOS.length;
-    while (lo < hi) { const m = (lo + hi) >> 1; if (COMBOS[m][2] <= lim + 1e-9) lo = m + 1; else hi = m; }
-    return Math.max(lo, 6);
-  }
 
   // Positions at a 7-handed table, by offset from the dealer button.
   const POS_BY_OFFSET = ['BTN', 'SB', 'BB', 'UTG', 'MP', 'HJ', 'CO'];
@@ -168,32 +163,63 @@
 
   // ---------- Equity ----------
 
-  // Monte Carlo equity. ranges: optional array of percentile limits, one per opponent;
-  // each opponent is dealt a random hand within its range (rejection sampling).
-  function equity(hole, board, nOpp, iters, ranges) {
+  // Small seeded generator so the coach gives the same answer for the same spot.
+  function seededRandom(text) {
+    let h = 2166136261;
+    for (let i = 0; i < text.length; i++) { h ^= text.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return function () {
+      h = (h + 0x6D2B79F5) | 0;
+      let t = Math.imul(h ^ (h >>> 15), 1 | h);
+      t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+      return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+    };
+  }
+
+  // Monte Carlo equity. lists: optional, one entry per opponent: an array of [card, card] combos
+  // the opponent may hold, or a number (top share of starting hands). Missing = any two cards.
+  function equity(hole, board, nOpp, iters, lists, rng) {
     if (nOpp <= 0) return 1;
+    rng = rng || Math.random;
     const used = new Set(hole.concat(board));
     const deck = [];
     for (let c = 0; c < 52; c++) if (!used.has(c)) deck.push(c);
     const L = deck.length;
+    const ranges = [];
+    for (let o = 0; o < nOpp; o++) {
+      let l = lists && lists[o];
+      if (typeof l === 'number') l = l >= 1 ? null : COMBOS.filter(c => c[2] <= l + 1e-9);
+      ranges.push(l && l.length ? l.filter(c => !used.has(c[0]) && !used.has(c[1])) : null);
+    }
     let won = 0;
     const taken = new Uint8Array(52);
+    const opp = new Array(nOpp * 2);
     for (let i = 0; i < iters; i++) {
       taken.fill(0);
-      const opp = [];
       for (let o = 0; o < nOpp; o++) {
-        const size = ranges && ranges[o] < 1 ? rangeSize(ranges[o]) : COMBOS.length;
-        let a, b, tries = 0;
-        do {
-          const pick = COMBOS[Math.floor(Math.random() * (tries < 60 ? size : COMBOS.length))];
-          a = pick[0]; b = pick[1]; tries++;
-        } while (taken[a] || taken[b] || used.has(a) || used.has(b));
-        taken[a] = taken[b] = 1;
-        opp.push(a, b);
+        const r = ranges[o];
+        let a = -1, b = -1;
+        if (r && r.length) {
+          for (let t = 0; t < 30 && a < 0; t++) {
+            const c = r[Math.floor(rng() * r.length)];
+            if (!taken[c[0]] && !taken[c[1]]) { a = c[0]; b = c[1]; }
+          }
+          if (a < 0) { // crowded: scan for any combo still available
+            const s = Math.floor(rng() * r.length);
+            for (let k = 0; k < r.length && a < 0; k++) {
+              const c = r[(s + k) % r.length];
+              if (!taken[c[0]] && !taken[c[1]]) { a = c[0]; b = c[1]; }
+            }
+          }
+        }
+        while (a < 0 || taken[a]) a = deck[Math.floor(rng() * L)];
+        taken[a] = 1;
+        while (b < 0 || taken[b]) b = deck[Math.floor(rng() * L)];
+        taken[b] = 1;
+        opp[2 * o] = a; opp[2 * o + 1] = b;
       }
       const full = board.slice();
       while (full.length < 5) {
-        const c = deck[Math.floor(Math.random() * L)];
+        const c = deck[Math.floor(rng() * L)];
         if (!taken[c]) { taken[c] = 1; full.push(c); }
       }
       const mine = score(hole.concat(full));
@@ -208,29 +234,89 @@
     return won / iters;
   }
 
-  // Range each opponent is likely to hold, read from their public actions only.
+  // ---------- Reading ranges from public actions ----------
+
+  // Rank combos by strength on a board: made hand first, with draws lifted to medium strength.
+  function strengthOrder(list, board) {
+    const rows = list.map(c => ({ c, s: score([c[0], c[1]].concat(board)) }));
+    rows.sort((a, b) => b.s - a.s);
+    const n = rows.length;
+    rows.forEach((r, i) => {
+      r.r = n > 1 ? i / (n - 1) : 0;
+      if (board.length < 5) {
+        const o = draws([r.c[0], r.c[1]], board).outs;
+        if (o >= 8) r.r = Math.min(r.r, 0.35);
+        else if (o >= 4) r.r = Math.min(r.r, 0.6);
+      }
+    });
+    return rows;
+  }
+
+  const BOARD_LEN = { flop: 3, turn: 4, river: 5 };
+  // Share of a range that continues with each action (strongest part), plus a bluff slice for bets.
+  const KEEP = { bet: 0.6, raise: 0.35, call: 0.75, bluff: 0.1, checkTop: 0.08 };
+
+  // The hands one opponent likely holds, built only from public information:
+  // their preflop action sets a starting range, then each street keeps the part of it
+  // that fits how they played on that board.
   function rangeFor(seat, view) {
-    let r = 1, raises = 0;
+    // Observed tendencies (public table stats) pull the textbook range toward how this player really plays.
+    const o = (view.opponents || []).find(q => q.seat === seat);
+    const w = o && o.hands ? Math.min(1, o.hands / 40) : 0;
+    const blend = (base, seen) => w ? (1 - w) * base + w * Math.max(base * 0.6, seen) : base;
+    let pre = 1, raises = 0;
     for (const a of view.actions) {
-      if (a.street === 'preflop') {
-        if (a.type === 'raise') {
-          if (a.seat === seat) r = raises === 0 ? (OPEN[view.posOf[seat]] || 0.15) : raises === 1 ? 0.08 : 0.03;
-          raises++;
-        } else if (a.type === 'call' && a.seat === seat) {
-          r = raises === 0 ? 0.5 : raises === 1 ? 0.28 : 0.08;
-        }
-      } else if (a.seat === seat) {
-        if (a.type === 'raise') r *= 0.6;
-        else if (a.type === 'call') r *= 0.8;
+      if (a.street !== 'preflop') continue;
+      if (a.type === 'raise') {
+        if (a.seat === seat) pre = raises === 0 ? blend(OPEN[view.posOf[seat]] || 0.15, o ? o.pfr : 0) : raises === 1 ? blend(0.08, o ? o.pfr / 3 : 0) : 0.03;
+        raises++;
+      } else if (a.type === 'call' && a.seat === seat) {
+        pre = raises === 0 ? blend(0.6, o ? o.vpip : 0) : raises === 1 ? blend(0.35, o ? o.vpip * 0.8 : 0) : 0.08;
       }
     }
-    return Math.max(0.02, r);
+    pre = Math.min(1, pre);
+    const dead = new Set(view.hole.concat(view.board));
+    const live = c => !dead.has(c[0]) && !dead.has(c[1]);
+    let list = COMBOS.filter(c => c[2] <= pre + 1e-9 && live(c));
+    let desc = pre >= 1 ? 'any two cards' : `the top ${pct(pre)} of starting hands`;
+    let aggressive = false;
+    for (const st of ['flop', 'turn', 'river']) {
+      const acts = view.actions.filter(a => a.street === st);
+      const mine = acts.filter(a => a.seat === seat);
+      if (!mine.length) continue;
+      const board = view.board.slice(0, BOARD_LEN[st]);
+      const rows = strengthOrder(list, board);
+      const lastAggr = mine.filter(a => a.type === 'raise').pop();
+      let keep;
+      if (lastAggr) {
+        const idx = acts.indexOf(lastAggr);
+        const facing = acts.slice(0, idx).some(a => a.type === 'raise' && a.seat !== seat);
+        const share = facing ? KEEP.raise : KEEP.bet;
+        keep = rows.filter(r => r.r <= share || r.r >= 1 - KEEP.bluff);
+        desc = facing ? 'mostly very strong hands, with a few bluffs' : 'strong hands and draws, plus some bluffs';
+        aggressive = true;
+      } else if (mine.some(a => a.type === 'call')) {
+        keep = rows.filter(r => r.r <= KEEP.call);
+        desc = 'medium-strength hands and draws';
+      } else {
+        keep = rows.filter(r => r.r >= KEEP.checkTop);
+        desc = 'mostly weaker hands (they checked)';
+      }
+      if (keep.length >= 3) list = keep.map(r => r.c);
+    }
+    return { list, pre, desc, aggressive };
   }
 
   // ---------- Strategy (the coach's baseline; v2 can swap in a solver table here) ----------
 
   const fairShare = n => 1 / (n + 1);
   const valueThreshold = n => fairShare(n) + (1 - fairShare(n)) * 0.3;
+  const CLOSE = 0.03; // within this much of a threshold, both actions are fine
+
+  const rankText = (key, p) => p <= 0.5
+    ? `${key} is in the top ${pct(p)} of starting hands`
+    : `${key} is among the weakest ${Math.max(1, Math.round((1 - p) * 100))}% of starting hands`;
+  const posLabel = pos => `the ${POS_NAMES[pos].toLowerCase()}`;
 
   function preflopPlan(v, pctAdj) {
     const p = pctAdj ?? handPct(v.hole);
@@ -238,24 +324,30 @@
     const raisesList = pre.filter(a => a.type === 'raise');
     const limpers = pre.filter(a => a.type === 'call').length;
     const key = handKey(v.hole), pos = v.pos;
-    const top = `${key} is in the top ${pct(p)} of starting hands`;
-    let rec, accept, raiseTo = 0, reason, concept;
+    const hand = rankText(key, p);
+    let rec, accept, raiseTo = 0, reason, continueTop;
+    const concept = 'ranges';
 
     if (raisesList.length === 0) {
       const open = OPEN[pos];
       raiseTo = BB * (pos === 'SB' ? 3 : 2.5) + limpers * BB;
-      if (v.toCall === 0) { // big blind option
-        rec = p <= 0.25 ? 'raise' : 'check';
-        reason = rec === 'raise' ? `${top}. Raise the limpers for value.` : `${top}. Check and see a free flop.`;
-        concept = 'position';
-      } else if (p <= open) {
-        rec = 'raise';
-        reason = `From the ${POS_NAMES[pos].toLowerCase()}, a solid strategy opens about ${pct(open)} of hands. ${top}, so raise to ${raiseTo}.`;
-        concept = 'ranges';
+      const limpNote = limpers ? ' Do not just call behind limpers: raise or fold.' : '';
+      if (v.toCall === 0) { // big blind option after limps
+        continueTop = 0.2;
+        rec = p <= continueTop ? 'raise' : 'check';
+        reason = rec === 'raise'
+          ? `${hand}. Raise to ${raiseTo} and punish the limpers.`
+          : `${hand}. Checking is free, so take the flop.`;
+      } else if (pos === 'SB' && limpers === 0 && p > open && p <= 0.6) {
+        continueTop = 0.6;
+        rec = 'call';
+        reason = `${hand}. Completing the small blind costs only ${v.toCall} more, which is cheap enough to see a flop.`;
       } else {
-        rec = 'fold';
-        reason = `From the ${POS_NAMES[pos].toLowerCase()}, open only about the top ${pct(open)}. ${top}, so fold.`;
-        concept = 'ranges';
+        continueTop = open;
+        rec = p <= open ? 'raise' : 'fold';
+        reason = rec === 'raise'
+          ? `From ${posLabel(pos)} a solid strategy opens the best ${pct(open)} of hands, and ${hand}. Raise to ${raiseTo}.${limpNote}`
+          : `From ${posLabel(pos)} you open only the best ${pct(open)} of hands; ${hand}, outside that range. Fold.${limpNote}`;
       }
       accept = [rec];
     } else {
@@ -266,79 +358,87 @@
         const rr = OPEN[raiserPos] || 0.15;
         const threeBet = Math.max(0.03, rr * 0.3);
         let callR = pos === 'BB' ? Math.min(0.55, rr * 1.5) : pos === 'SB' ? rr * 0.5 : ip ? rr * 0.75 : rr * 0.6;
-        if (pre.filter(a => a.type === 'call').length) callR *= 0.85;
+        if (limpers) callR *= 0.85;
+        continueTop = callR;
         raiseTo = Math.round(v.currentBet * (ip ? 3 : 4) / 10) * 10;
-        if (p <= threeBet) { rec = 'raise'; reason = `${top}, strong enough to re-raise (3-bet) an opener from ${raiserPos} to ${raiseTo}.`; }
-        else if (p <= callR) { rec = 'call'; reason = `${top}. Against a ${raiserPos} open (about ${pct(rr)} of hands) this is a call${ip ? ', helped by acting last after the flop' : ''}.`; }
-        else { rec = 'fold'; reason = `A ${raiserPos} opener holds about the top ${pct(rr)}. ${top}, which plays poorly against that range. Fold.`; }
-        concept = 'ranges';
+        const opener = `A player opening from ${posLabel(raiserPos)} holds about the best ${pct(rr)} of hands`;
+        if (p <= threeBet) { rec = 'raise'; reason = `${opener}. ${hand}, strong enough to re-raise (a 3-bet) to ${raiseTo}.`; }
+        else if (p <= callR) { rec = 'call'; reason = `${opener}. ${hand}: good enough to call${pos === 'BB' ? ', helped by the discount you already paid as the big blind' : ip ? ', helped by acting last after the flop' : ''}, not strong enough to re-raise.`; }
+        else { rec = 'fold'; reason = `${opener}. ${hand}, which does badly against that range. Fold.`; }
       } else if (raisesList.length === 2) {
+        continueTop = 0.10;
         raiseTo = Math.round(v.currentBet * 2.3 / 10) * 10;
-        if (p <= 0.025) { rec = 'raise'; reason = `${top}. Facing a 3-bet, 4-bet the very best hands.`; }
-        else if (p <= 0.10) { rec = 'call'; reason = `${top}. Strong enough to call a 3-bet, not to 4-bet.`; }
-        else { rec = 'fold'; reason = `A 3-bet range is narrow, so continue with about the top 10%. ${top}. Fold.`; }
-        concept = 'ranges';
+        if (p <= 0.025) { rec = 'raise'; reason = `${hand}. Against a re-raise (3-bet), raise again (4-bet) with only the very best hands.`; }
+        else if (p <= 0.10) { rec = 'call'; reason = `${hand}. Strong enough to call a 3-bet, not to 4-bet.`; }
+        else { rec = 'fold'; reason = `A 3-bet is a narrow range, so continue with about the best 10% of hands. ${hand}. Fold.`; }
       } else {
+        continueTop = 0.035;
         raiseTo = v.maxTo;
-        if (p <= 0.02) { rec = 'raise'; reason = `${top}. Against a 4-bet, only premium pairs and AK continue, and this one goes all-in.`; }
-        else if (p <= 0.035) { rec = 'call'; reason = `${top}. Just good enough to call a 4-bet.`; }
-        else { rec = 'fold'; reason = `A 4-bet range is the top 2–3% of hands. ${top}. Fold.`; }
-        concept = 'ranges';
+        if (p <= 0.02) { rec = 'raise'; reason = `${hand}. Against a 4-bet only the best pairs and AK continue, and this hand goes all-in.`; }
+        else if (p <= 0.035) { rec = 'call'; reason = `${hand}. Just good enough to call a 4-bet.`; }
+        else { rec = 'fold'; reason = `A 4-bet range is the best 2–3% of hands. ${hand}. Fold.`; }
       }
       accept = [rec];
       if (rec === 'raise') accept.push('call');
     }
     if (rec === 'raise' && !v.canRaise) { rec = v.toCall > 0 ? 'call' : 'check'; accept = [rec]; }
-    return { rec, accept, raiseTo: clamp(raiseTo, Math.min(v.minTo, v.maxTo), v.maxTo), reason, concept, handPct: p };
+    return { rec, accept, raiseTo: clamp(raiseTo, Math.min(v.minTo, v.maxTo), v.maxTo), reason, concept, handPct: p, continueTop, limpSpot: raisesList.length === 0 };
   }
 
-  function postflopPlan(v, eq) {
+  const lower = s => s[0].toLowerCase() + s.slice(1);
+
+  // reads: optional [{name, desc, aggressive}] for the explanation; bots pass none.
+  function postflopPlan(v, eq, reads) {
     const n = v.nOpp;
     const required = v.toCall > 0 ? v.toCall / (v.pot + v.toCall) : 0;
     const valueT = valueThreshold(n);
     const tex = texture(v.board);
     const dr = draws(v.hole, v.board);
-    const eqTxt = `about ${pct(eq)} equity against the hands your opponent${n === 1 ? '' : 's'} likely hold${n === 1 ? 's' : ''}`;
-    const drawTxt = dr.names.length ? ` You have a ${dr.names.join(' and ')} (${dr.outs} outs).` : '';
+    let read = '';
+    if (reads && reads.length) {
+      const lead = reads.find(r => r.aggressive) || reads[0];
+      read = `Read: ${lead.name} likely has ${lead.desc}${reads.length > 1 ? `, with ${reads.length - 1} other player${reads.length > 2 ? 's' : ''} also in` : ''}. `;
+    }
+    const know = `You have ${lower(describeHand(v.hole, v.board))}: about ${pct(eq)} equity against ${n === 1 ? 'that range' : 'those ranges'}.`;
     let rec, accept, raiseTo = 0, reason, concept;
 
     if (v.toCall === 0) {
       const frac = tex === 'wet' ? 0.66 : 0.33;
       raiseTo = Math.max(BB, Math.round(v.pot * frac / 10) * 10);
       if (eq >= valueT && v.canRaise) {
-        rec = 'raise'; accept = ['raise'];
-        reason = `You have ${eqTxt}, enough to bet for value. On a ${tex} board, bet about ${Math.round(frac * 100)}% of the pot (${raiseTo}).`;
+        rec = 'raise'; accept = eq < valueT + CLOSE ? ['raise', 'check'] : ['raise'];
+        reason = `${read}${know} Plan: bet about ${Math.round(frac * 100)}% of the pot (${raiseTo}) for value; worse hands can still call${tex === 'wet' ? ' and draws must pay' : ''}.`;
         concept = 'sizing';
       } else if (v.aggressor === v.seat && v.street === 'flop' && n === 1 && tex === 'dry' && v.canRaise) {
         rec = 'raise'; accept = ['raise', 'check']; raiseTo = Math.max(BB, Math.round(v.pot * 0.33 / 10) * 10);
-        reason = `You raised before the flop, and this dry board favours your range. A small continuation bet (${raiseTo}, a third of the pot) works with much of your range. Checking is also fine.`;
+        reason = `${read}${know} Plan: you raised before the flop and this dry board favours your range, so a small continuation bet (${raiseTo}) works. Checking is also fine.`;
         concept = 'cbet';
       } else if (dr.outs >= 8 && n <= 2 && v.canRaise) {
         rec = 'raise'; accept = ['raise', 'check']; raiseTo = Math.max(BB, Math.round(v.pot * 0.5 / 10) * 10);
-        reason = `You have ${eqTxt}.${drawTxt} A semi-bluff bet of ${raiseTo} can win now or improve later. Checking is also fine.`;
+        reason = `${read}${know} Plan: with ${dr.outs} outs, a semi-bluff bet of ${raiseTo} can win now or improve later. Checking is also fine.`;
         concept = 'draws';
       } else {
-        rec = 'check'; accept = ['check'];
-        reason = `You have ${eqTxt}.${drawTxt} Not strong enough to bet for value, so check.`;
+        rec = 'check'; accept = eq >= valueT - CLOSE && v.canRaise ? ['check', 'raise'] : ['check'];
+        reason = `${read}${know} Plan: check. A bet would mostly be called by better hands.`;
         concept = 'equity';
       }
     } else {
-      const potBefore = v.pot - v.toCall, mdf = potBefore / (potBefore + v.toCall);
       raiseTo = Math.round(v.currentBet * 3 / 10) * 10;
-      const odds = `Calling ${v.toCall} to win ${v.pot + v.toCall} needs ${pct(required)} equity`;
+      const price = `Price: calling ${v.toCall} to win ${v.pot + v.toCall} needs ${pct(required)} equity. `;
+      const close = Math.abs(eq - required) < CLOSE;
       if (eq >= valueT + 0.12 && v.canRaise) {
         rec = 'raise'; accept = ['raise', 'call'];
-        reason = `You have ${eqTxt}, well ahead. Raise to about ${raiseTo} for value; calling is also fine.`;
+        reason = `${read}${price}${know} Plan: raise to about ${raiseTo} for value; calling is also fine.`;
         concept = 'sizing';
       } else if (eq >= required) {
-        rec = 'call'; accept = ['call'];
+        rec = 'call'; accept = close ? ['call', 'fold'] : ['call'];
         if (dr.outs >= 8 && v.canRaise) accept.push('raise');
-        reason = `${odds}, and you have ${eqTxt}.${drawTxt} Call.`;
-        concept = 'potodds';
+        reason = `${read}${price}${know} Plan: ${close ? 'a close call; folding is also fine' : 'call'}.`;
+        concept = dr.outs >= 4 ? 'draws' : 'potodds';
       } else {
-        rec = 'fold'; accept = ['fold'];
-        reason = `${odds}, but you have only ${eqTxt}.${drawTxt} Against this bet you only need to defend ${pct(mdf)} of your range; this hand is in the part that folds.`;
-        concept = 'mdf';
+        rec = 'fold'; accept = close ? ['fold', 'call'] : ['fold'];
+        reason = `${read}${price}${know} Plan: ${close ? 'a close fold; calling is also fine' : 'fold, the price is higher than your share of the pot'}.`;
+        concept = 'potodds';
       }
     }
     if (rec === 'raise' && !v.canRaise) { rec = v.toCall > 0 ? 'call' : 'check'; accept = [rec]; }
@@ -353,22 +453,27 @@
 
   function Coach() { this.cache = new Map(); }
 
-  Coach.prototype.equity = function (v) {
-    const ranges = v.opponents.map(o => rangeFor(o.seat, v));
-    const key = v.hole.slice().sort().join(',') + '|' + v.board.join(',') + '|' + ranges.map(r => r.toFixed(3)).join(',');
-    let eq = this.cache.get(key);
-    if (eq === undefined) {
-      if (this.cache.size > 4000) this.cache.clear();
-      eq = equity(v.hole, v.board, v.nOpp, 700, ranges);
-      this.cache.set(key, eq);
+  Coach.prototype.read = function (v) {
+    const key = v.hole.join(',') + '|' + v.board.join(',') + '|' + v.opponents.map(o => o.seat).join(',') + '|' +
+      v.actions.map(a => a.seat + a.type[0] + a.street[0]).join('') + '|' + v.pos + '|' +
+      v.opponents.map(o => Math.min(40, o.hands) + ':' + Math.round(o.vpip * 20) + ':' + Math.round(o.pfr * 20)).join(',');
+    let hit = this.cache.get(key);
+    if (!hit) {
+      if (this.cache.size > 3000) this.cache.clear();
+      const ranges = v.opponents.map(o => ({ name: o.name, ...rangeFor(o.seat, v) }));
+      const eq = equity(v.hole, v.board, v.nOpp, v.street === 'preflop' ? 600 : 1500, ranges.map(r => r.list), seededRandom(key));
+      hit = { eq, reads: ranges.map(r => ({ name: r.name, desc: r.desc, aggressive: r.aggressive })) };
+      this.cache.set(key, hit);
     }
-    return eq;
+    return hit;
   };
 
+  Coach.prototype.equity = function (v) { return this.read(v).eq; };
+
   Coach.prototype.advise = function (v) {
-    const eq = this.equity(v);
+    const { eq, reads } = this.read(v);
     const required = v.toCall > 0 ? v.toCall / (v.pot + v.toCall) : 0;
-    const plan = v.street === 'preflop' ? preflopPlan(v) : postflopPlan(v, eq);
+    const plan = v.street === 'preflop' ? preflopPlan(v) : postflopPlan(v, eq, reads);
     return { ...plan, eq, required, evCall: eq * (v.pot + v.toCall) - v.toCall };
   };
 
@@ -390,6 +495,12 @@
     } else if (A === 'fold' && v.toCall === 0) {
       grade = 'blunder'; loss = adv.eq * v.pot / bb; leak = LEAK.freeFold;
       note = 'You folded when checking was free. Never fold when nothing is owed.';
+    } else if (pre && A === 'call' && adv.limpSpot && v.pos !== 'BB') {
+      grade = R === 'raise' ? 'ok' : 'mistake';
+      loss = R === 'raise' ? 0 : Math.min(put / bb, 6) * 0.35;
+      leak = R === 'raise' ? LEAK.missValue : LEAK.looseFold;
+      note = `Limping (just calling the big blind) is a leak: it gives up the chance to win the pot right away and invites raises. ${R === 'raise' ? 'Raise this hand.' : 'Fold this hand.'} ${adv.reason}`;
+      if (R !== 'raise') lesson.push(['openMult', -0.03]);
     } else if (pre) {
       if (A === 'fold') {
         loss = adv.handPct < 0.06 ? 3 : 0.6;
@@ -489,7 +600,7 @@
       if (plan.rec === 'fold' && v.toCall > 0 && v.toCall <= BB && Math.random() < -prof.callMargin * 2) return { action: 'call' };
       return { action: plan.rec };
     }
-    const ranges = v.opponents.map(o => rangeFor(o.seat, v));
+    const ranges = v.opponents.map(o => rangeFor(o.seat, v).list);
     const est = clamp(equity(v.hole, v.board, v.nOpp, 160, ranges) + gauss() * prof.noise, 0, 1);
     const plan = postflopPlan(v, est);
     const required = v.toCall > 0 ? v.toCall / (v.pot + v.toCall) : 0;
@@ -590,7 +701,8 @@
       minTo: this.currentBet + this.minRaise, maxTo,
       canRaise: maxTo > this.currentBet && others.some(canAct),
       nOpp: others.length, aggressor: this.aggressor,
-      opponents: others.map(q => ({ seat: q.seat, name: q.name, stack: q.chips, bet: q.bet, allIn: q.allIn, pos: posOf[q.seat] })),
+      opponents: others.map(q => ({ seat: q.seat, name: q.name, stack: q.chips, bet: q.bet, allIn: q.allIn, pos: posOf[q.seat],
+        hands: q.stats.hands, vpip: q.stats.hands ? q.stats.vpip / q.stats.hands : 0, pfr: q.stats.hands ? q.stats.pfr / q.stats.hands : 0 })),
       actions: this.actions.map(a => ({ seat: a.seat, street: a.street, type: a.type, to: a.to })),
       history: this.actions.map(a => a.text),
     };
@@ -668,7 +780,7 @@
     const r = {
       id: ++this.reviewSeq, hand: v.hand, street: v.street, seat: p.seat, name: p.name, human: p.human,
       view: v, decision: dec, actionText: text, rec: adv.rec, accept: adv.accept, recTo: adv.raiseTo,
-      eq: adv.eq, required: adv.required, grade: rev.grade, loss: rev.loss, note: rev.note, leak: rev.leak, concept: rev.concept,
+      eq: adv.eq, required: adv.required, handPct: adv.handPct, continueTop: adv.continueTop, grade: rev.grade, loss: rev.loss, note: rev.note, leak: rev.leak, concept: rev.concept,
     };
     this.reviews.push(r);
     if (this.reviews.length > 500) this.reviews.shift();
@@ -751,11 +863,31 @@
     return 'act';
   };
 
-  // Hero's current made hand and draws, for the player's own display.
+  const RANK_PLURAL = ['twos', 'threes', 'fours', 'fives', 'sixes', 'sevens', 'eights', 'nines', 'tens', 'jacks', 'queens', 'kings', 'aces'];
+
+  function pairName(hole, board) {
+    const br = board.map(rankOf).sort((a, b) => b - a);
+    const [h1, h2] = hole.map(rankOf);
+    if (h1 === h2) return h1 > br[0] ? `Overpair (${RANK_PLURAL[h1]})` : h1 < br[br.length - 1] ? `Underpair (${RANK_PLURAL[h1]})` : `Pocket pair (${RANK_PLURAL[h1]}) below the top card`;
+    const pr = br.includes(h1) ? h1 : h2;
+    if (pr === br[0]) return `Top pair (${RANK_PLURAL[pr]})`;
+    if (pr === br[br.length - 1]) return `Bottom pair (${RANK_PLURAL[pr]})`;
+    return `Middle pair (${RANK_PLURAL[pr]})`;
+  }
+
+  // Hero's made hand and draws in coaching terms, e.g. "Top pair (kings) + flush draw".
   function describeHand(hole, board) {
-    if (board.length < 3) return `${handKey(hole)} · top ${pct(handPct(hole))} of starting hands`;
+    if (board.length < 3) return `${handKey(hole)} · ${handPct(hole) <= 0.5 ? 'top ' + pct(handPct(hole)) : 'weakest ' + Math.max(1, Math.round((1 - handPct(hole)) * 100)) + '%'} of starting hands`;
+    const cat = Math.floor(score(hole.concat(board)) / CAT_BASE);
+    const bcat = Math.floor(score(board) / CAT_BASE);
+    let name = CATEGORIES[cat];
+    if (cat === 1) name = bcat === 1 ? 'Only the pair on the board' : pairName(hole, board);
+    else if (cat === 2 && bcat === 2) name = 'Only the two pair on the board';
+    else if (cat === 2 && bcat === 1) name = 'Two pair (one pair is on the board)';
+    else if (cat === 3 && bcat === 3) name = 'Three of a kind on the board';
+    else if (cat === 0) name = 'No pair, ' + RANKS[Math.max(...hole.map(rankOf))].replace('T', '10') + ' high';
     const d = draws(hole, board);
-    return categoryName(score(hole.concat(board))) + (d.names.length ? ' + ' + d.names.join(' + ') : '');
+    return name + (d.names.length ? ' + ' + d.names.join(' + ') : '');
   }
 
   // Parse cards like "AsKd", "Ah 10c", "qh7c2d" into card ints. Throws on bad or duplicate cards.

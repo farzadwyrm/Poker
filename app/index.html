@@ -478,11 +478,15 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
   }
 
   // ---------- Coach ----------
+  // Preflop the coach compares your hand's rank with the range for the spot; after the flop, equity with the price.
   function adviceFacts(v, adv) {
-    return `<div class="facts">
-      <div><span class="label">Equity</span><b>${pct(adv.eq)}</b></div>
-      <div><span class="label">Needed</span><b>${v.toCall ? pct(adv.required) : '—'}</b></div>
-      <div><span class="label">Position</span><b>${v.pos}</b></div></div>`;
+    const tile = (l, x) => `<div><span class="label">${l}</span><b>${x}</b></div>`;
+    if (v.street === 'preflop') {
+      const hp = adv.handPct ?? P.handPct(v.hole);
+      const rank = hp <= 0.5 ? 'Top ' + pct(hp) : 'Weakest ' + Math.max(1, Math.round((1 - hp) * 100)) + '%';
+      return `<div class="facts">${tile('Your hand', rank)}${tile('Plays here', adv.continueTop ? 'Top ' + pct(adv.continueTop) : '—')}${tile('Position', v.pos)}</div>`;
+    }
+    return `<div class="facts">${tile('Equity', pct(adv.eq))}${tile('Needed', v.toCall ? pct(adv.required) : '—')}${tile('Position', v.pos)}</div>`;
   }
   const conceptChip = k => k && P.CONCEPTS[k] ? `<button class="concept" type="button" data-concept="${k}">${P.CONCEPTS[k].title}</button>` : '';
   // "calls 20" -> "call 20" when the subject is "You".
@@ -561,7 +565,7 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
         ${r.loss > 0 ? `<span class="num" style="color:var(--bad)">−${r.loss.toFixed(1)} BB</span>` : ''}</div>
       <div class="row">${v.hole.map(c => cardHTML(c)).join('')}<span style="width:8px"></span>${v.board.map(c => cardHTML(c)).join('')}</div>
       <p>${esc(r.note)}</p>
-      ${adviceFacts(v, { eq: r.eq, required: r.required })}
+      ${adviceFacts(v, r)}
       <div>${conceptChip(r.concept)}</div>
       ${drillHTML}${claude}
       <div><button class="btn small" type="button" id="discuss">Discuss in chat</button></div>
