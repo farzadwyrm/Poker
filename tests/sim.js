@@ -45,3 +45,11 @@ assert.deepStrictEqual(P.draws(hand('Ac Kd'), hand('Qh Js 2c')).names, ['gutshot
 const eqRange = P.equity(hand('Qh Qd'), [], 1, 3000, [0.03]);
 assert.ok(eqRange > 0.5 && eqRange < 0.61, 'QQ vs top 3% should be ~56%, got ' + eqRange);
 console.log('Strategy checks OK');
+
+assert.deepStrictEqual(P.parseCards('As Kd'), hand('As Kd'));
+assert.deepStrictEqual(P.parseCards('10h9h'), hand('Th 9h'));
+assert.throws(() => P.parseCards('AsAs'));
+assert.strictEqual(P.handKey(P.holeFromKey('AJo')), 'AJo');
+assert.strictEqual(P.handKey(P.holeFromKey('T9s')), 'T9s');
+assert.strictEqual(P.handKey(P.holeFromKey('77')), '77');
+console.log('Parsing checks OK');

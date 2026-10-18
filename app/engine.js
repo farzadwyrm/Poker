@@ -275,8 +275,8 @@
       } else if (raisesList.length === 2) {
         raiseTo = Math.round(v.currentBet * 2.3 / 10) * 10;
         if (p <= 0.025) { rec = 'raise'; reason = `${top}. Facing a 3-bet, 4-bet the very best hands.`; }
-        else if (p <= 0.08) { rec = 'call'; reason = `${top}. Strong enough to call a 3-bet, not to 4-bet.`; }
-        else { rec = 'fold'; reason = `A 3-bet range is narrow, around the top 8%. ${top}. Fold.`; }
+        else if (p <= 0.10) { rec = 'call'; reason = `${top}. Strong enough to call a 3-bet, not to 4-bet.`; }
+        else { rec = 'fold'; reason = `A 3-bet range is narrow, so continue with about the top 10%. ${top}. Fold.`; }
         concept = 'ranges';
       } else {
         raiseTo = v.maxTo;
@@ -758,6 +758,34 @@
     return categoryName(score(hole.concat(board))) + (d.names.length ? ' + ' + d.names.join(' + ') : '');
   }
 
+  // Parse cards like "AsKd", "Ah 10c", "qh7c2d" into card ints. Throws on bad or duplicate cards.
+  function parseCards(str) {
+    const t = String(str || '').replace(/10/g, 'T').replace(/[\s,]+/g, '');
+    if (t.length % 2) throw new Error(`Cannot read cards "${str}". Use rank + suit, e.g. AsKd.`);
+    const out = [];
+    for (let i = 0; i < t.length; i += 2) {
+      const r = RANKS.indexOf(t[i].toUpperCase()), s = SUIT_LETTERS.indexOf(t[i + 1].toLowerCase());
+      if (r < 0 || s < 0) throw new Error(`Cannot read card "${t.slice(i, i + 2)}". Ranks 2-9 T J Q K A, suits s h d c.`);
+      const c = r * 4 + s;
+      if (out.includes(c)) throw new Error(`Card ${t.slice(i, i + 2)} appears twice.`);
+      out.push(c);
+    }
+    return out;
+  }
+
+  // A concrete two-card hand for a class like "AJo", "T9s" or "77".
+  function holeFromKey(key) {
+    const k = String(key || '').trim();
+    if (/^[2-9TJQKA]{2}[so]?$/i.test(k)) {
+      const a = RANKS.indexOf(k[0].toUpperCase()), b = RANKS.indexOf(k[1].toUpperCase());
+      const suited = a !== b && (k[2] || 'o').toLowerCase() === 's';
+      return [a * 4, b * 4 + (suited ? 0 : 1)];
+    }
+    const cards = parseCards(k);
+    if (cards.length !== 2) throw new Error(`Give a hand like "AJo", "T9s", "77" or "AsJd".`);
+    return cards;
+  }
+
   // Compact one-line summary of a decision for an LLM prompt (token-lean by design).
   function viewSummary(r) {
     const v = r.view;
@@ -778,7 +806,7 @@
   const API = {
     RANKS, SUIT_GLYPHS, SB, BB, START, CATEGORIES, PROFILES, CONCEPTS, POS_NAMES, OPEN,
     rankOf, suitOf, cardText, score, categoryName, equity, handKey, handPct, texture, draws, rangeFor,
-    preflopPlan, postflopPlan, describeHand, Coach, Game, viewSummary,
+    preflopPlan, postflopPlan, describeHand, parseCards, holeFromKey, Coach, Game, viewSummary,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else root.Poker = API;

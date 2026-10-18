@@ -195,6 +195,15 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
 .drift { font-family: var(--f-mono); font-size: 12px; }
 .drift .arrow { color: var(--muted); }
 .log { font: 12px/1.7 var(--f-mono); color: var(--muted); max-height: 260px; overflow: auto; }
+.chat { display: grid; gap: 10px; }
+.msgs { display: grid; gap: 8px; max-height: 440px; overflow: auto; padding: 2px; align-content: start; }
+.msg { max-width: 78ch; padding: 9px 12px; border-radius: 12px; font-size: 13.5px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.msg.user { justify-self: end; background: var(--accent-soft); border-radius: 12px 12px 4px 12px; }
+.msg.assistant { justify-self: start; background: var(--sunk); border-radius: 4px 12px 12px 12px; }
+.msg.err { color: var(--bad); }
+.composer { display: flex; gap: 8px; align-items: flex-end; }
+.composer textarea { flex: 1; min-width: 0; min-height: 44px; max-height: 160px; resize: vertical; font: 14px/1.4 var(--f-body); padding: 10px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--surface); color: var(--fg); }
+.suggest { display: flex; flex-wrap: wrap; gap: 6px; }
 .note { font-size: 12.5px; color: var(--muted); margin-bottom: 10px; max-width: 80ch; }
 @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
 </style>
@@ -240,7 +249,8 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
 
   <section class="panel" aria-label="Study">
     <div class="tabs" role="tablist">
-      <button class="tab" role="tab" data-tab="lessons" aria-selected="true">Lessons</button>
+      <button class="tab" role="tab" data-tab="chat" aria-selected="true">Coach chat</button>
+      <button class="tab" role="tab" data-tab="lessons" aria-selected="false">Lessons</button>
       <button class="tab" role="tab" data-tab="opponents" aria-selected="false">Opponents</button>
       <button class="tab" role="tab" data-tab="log" aria-selected="false">Hand log</button>
     </div>
@@ -271,8 +281,9 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
 
   let mode = 'teach', speed = 550, watching = false, running = false, timer = null;
   let advice = null, adviceKey = '', quizShown = false;
-  let shownId = null, drill = null, tab = 'lessons', hlConcept = null;
-  let sample = null; const claudeState = {};
+  let shownId = null, drill = null, tab = 'chat', hlConcept = null;
+  let sample = null, toolsOk = false; const claudeState = {};
+  const chat = []; let chatBusy = false, chatCtl = null;
 
   // ---------- Progress (per viewer, kept in this browser) ----------
   const STORE = 'pokercoach.progress.v2';
@@ -510,6 +521,14 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
     body.querySelectorAll('[data-concept]').forEach(b => b.onclick = () => openConcept(b.dataset.concept));
     const ask = $('askClaude');
     if (ask) ask.onclick = () => askClaude(r);
+    const disc = $('discuss');
+    if (disc) disc.onclick = () => {
+      tab = 'chat'; renderTabs();
+      const box = $('chatInput');
+      box.value = `Review this decision with me: ${P.viewSummary(r)}`;
+      box.focus();
+      $('tabpane').scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    };
     body.querySelectorAll('[data-drill]').forEach(b => b.onclick = () => {
       const v = r.view, a = b.dataset.drill;
       const adv2 = game.coach.advise(v);
@@ -545,6 +564,7 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
       ${adviceFacts(v, { eq: r.eq, required: r.required })}
       <div>${conceptChip(r.concept)}</div>
       ${drillHTML}${claude}
+      <div><button class="btn small" type="button" id="discuss">Discuss in chat</button></div>
     </div>`;
   }
   function lastHeroReviewId() {
@@ -594,6 +614,11 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
   function renderTabs() {
     document.querySelectorAll('.tab').forEach(t => { t.setAttribute('aria-selected', String(t.dataset.tab === tab)); t.onclick = () => { tab = t.dataset.tab; hlConcept = null; renderTabs(); }; });
     const pane = $('tabpane');
+    if (tab === 'chat') {
+      if (pane.dataset.tab !== 'chat') { pane.dataset.tab = 'chat'; pane.innerHTML = chatShell(); bindChat(); renderChat(); }
+      return;
+    }
+    pane.dataset.tab = tab;
     if (tab === 'lessons') {
       pane.innerHTML = `<p class="note">Concepts from modern solver-based (GTO) strategy. Each graded decision is tagged with the concept it tests, and your practice score shows here.</p>
         <div class="lessons">${Object.entries(P.CONCEPTS).map(([k, c]) => {
@@ -625,6 +650,146 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
       if (game.lastResult) lines.push(...game.lastResult.winners.map(w => `${esc(w.name)} wins ${fmt(w.amount)}${w.hand ? ' (' + w.hand + ')' : ''}`));
       pane.innerHTML = `<div class="log">${lines.length ? lines.join('<br>') : 'The current hand\'s actions appear here.'}</div>`;
     }
+  }
+
+  // ---------- Coach chat ----------
+  // Claude handles the conversation; all numbers come from the local engine through page tools.
+  const SUGGESTIONS = [
+    'Explain 3-bet ranges simply',
+    'How should I play against a calling station?',
+    'I had AsKd on the button, flop Qh7c2d, villain bet half pot. Call or raise?',
+    'What are my biggest leaks so far and how do I fix them?',
+  ];
+
+  function chatRules() {
+    const leaks = Object.entries(hero.stats.leaks).sort((a, b) => b[1] - a[1]).slice(0, 3).map(([k, n]) => `${k} (${n})`).join(', ');
+    const acc = progress.decisions ? pct((progress.good + progress.ok / 2) / progress.decisions) : 'no data';
+    return `You are a friendly No-Limit Hold'em study coach in a training app. Teach with modern solver (GTO) ideas plus exploitative adjustments. ` +
+      `Answer in under 120 words unless asked for more; plain language, define jargon once. Use the tools for equity and preflop ranges instead of estimating numbers. ` +
+      `This chat is for study and for reviewing finished hands. If the player says a real-money hand on another site is in progress, say you will review it once the hand is over. ` +
+      `Player in this app: accuracy ${acc}; top leaks: ${leaks || 'none yet'}.`;
+  }
+
+  const POSITIONS = ['UTG', 'MP', 'HJ', 'CO', 'BTN', 'SB', 'BB'];
+  const TOOLS = [
+    {
+      name: 'equity',
+      description: 'Monte Carlo equity for a hand against opponent ranges. Returns equity 0-1, the made hand, draws and outs; with pot and to_call also returns required equity and minimum defense frequency.',
+      inputSchema: { type: 'object', properties: {
+        hero: { type: 'string', description: 'Hero hole cards, e.g. "AsKd"' },
+        board: { type: 'string', description: 'Board cards, e.g. "Qh7c2d", or empty' },
+        opponent_ranges: { type: 'array', items: { type: 'number' }, description: 'One per opponent: top share of hands held, 0.02 to 1 (1 = any two cards). Opener UTG ~0.15, BTN ~0.44, 3-bettor ~0.08.' },
+        pot: { type: 'number', description: 'Pot before hero acts, including any bet faced' },
+        to_call: { type: 'number' },
+      }, required: ['hero', 'opponent_ranges'] },
+      execute(i) {
+        const hole = P.parseCards(i.hero), board = P.parseCards(i.board || '');
+        if (hole.length !== 2) throw new Error('hero needs exactly two cards');
+        if (board.length > 5) throw new Error('board has at most five cards');
+        const ranges = (Array.isArray(i.opponent_ranges) && i.opponent_ranges.length ? i.opponent_ranges : [1]).slice(0, 6).map(x => Math.min(1, Math.max(0.02, Number(x) || 1)));
+        const eq = P.equity(hole, board, ranges.length, 2500, ranges);
+        const out = { equity: Math.round(eq * 1000) / 1000, hand: P.describeHand(hole, board) };
+        const pot = Number(i.pot), call = Number(i.to_call);
+        if (pot > 0 && call > 0) {
+          out.required_equity = Math.round(call / (pot + call) * 1000) / 1000;
+          out.mdf = Math.round((pot - call) / pot * 1000) / 1000;
+        }
+        return out;
+      },
+    },
+    {
+      name: 'preflop_advice',
+      description: 'Solver-style preflop action for a 7-handed 100bb cash game. Returns the recommended action, raise size in chips (blinds 10/20), the hand percentile, and a reason.',
+      inputSchema: { type: 'object', properties: {
+        hand: { type: 'string', description: 'Hand class like "AJo", "T9s", "77", or exact cards "AsJd"' },
+        position: { type: 'string', enum: POSITIONS },
+        facing: { type: 'string', enum: ['unopened', 'open', '3bet', '4bet'], description: 'unopened = folded to hero; open = one raise before hero; 3bet = hero opened and got re-raised; 4bet = hero 3-bet and got re-raised' },
+        raiser_position: { type: 'string', enum: POSITIONS },
+      }, required: ['hand', 'position', 'facing'] },
+      execute(i) {
+        const pos = POSITIONS.includes(i.position) ? i.position : 'CO';
+        const rpos = POSITIONS.includes(i.raiser_position) && i.raiser_position !== pos ? i.raiser_position : (pos === 'BTN' ? 'CO' : 'BTN');
+        const raise = seat => ({ seat, street: 'preflop', type: 'raise' });
+        const spots = {
+          unopened: { actions: [], currentBet: P.BB, toCall: pos === 'BB' ? 0 : pos === 'SB' ? P.SB : P.BB },
+          open: { actions: [raise(1)], currentBet: 50, toCall: 50 },
+          '3bet': { actions: [raise(0), raise(1)], currentBet: 150, toCall: 100 },
+          '4bet': { actions: [raise(1), raise(0), raise(1)], currentBet: 350, toCall: 200 },
+        };
+        const sp = spots[i.facing] || spots.unopened;
+        const v = { hole: P.holeFromKey(i.hand), pos, posOf: { 0: pos, 1: rpos }, street: 'preflop', canRaise: true,
+          actions: sp.actions, currentBet: sp.currentBet, toCall: sp.toCall, minTo: sp.currentBet * 2, maxTo: P.START };
+        const plan = P.preflopPlan(v);
+        return { action: plan.rec, raise_to: plan.rec === 'raise' ? plan.raiseTo : null, hand_percentile: Math.round(plan.handPct * 1000) / 1000, reason: plan.reason };
+      },
+    },
+  ];
+
+  function chatShell() {
+    return `<div class="chat">
+      <p class="note">Talk strategy or walk the coach through a hand you played. Numbers come from the app's own equity and range calculator. For study and finished hands only: real-money sites ban outside help during a hand.</p>
+      <div class="msgs" id="msgs" aria-live="polite"></div>
+      <div class="suggest" id="suggest"></div>
+      <div class="composer">
+        <textarea id="chatInput" placeholder="Ask about a spot, a concept, or a hand you played…" aria-label="Message the coach"></textarea>
+        <button class="btn primary" type="button" id="chatSend">Send</button>
+      </div>
+    </div>`;
+  }
+
+  function bindChat() {
+    const box = $('chatInput');
+    $('chatSend').onclick = () => { if (chatBusy) chatCtl?.abort(); else sendChat(box.value); };
+    box.onkeydown = e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); if (!chatBusy) sendChat(box.value); } };
+  }
+
+  const fmtMsg = t => esc(t).replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
+
+  function renderChat() {
+    const msgs = $('msgs');
+    if (!msgs) return;
+    if (!sample) {
+      msgs.innerHTML = `<div class="msg assistant">Coach chat works when this page is opened in Claude and Claude is allowed for it.</div>`;
+    } else if (!chat.length) {
+      msgs.innerHTML = `<div class="msg assistant">Hi, I'm your coach. Ask me about any spot, or describe a hand you played (cards, position, board, bets) and we'll go through it.</div>`;
+    } else {
+      msgs.innerHTML = chat.map(m => `<div class="msg ${m.role}${m.err ? ' err' : ''}">${m.content ? fmtMsg(m.content) : 'Thinking…'}</div>`).join('');
+      msgs.scrollTop = msgs.scrollHeight;
+    }
+    $('suggest').innerHTML = sample && !chat.length ? SUGGESTIONS.map((t, k) => `<button class="pill concept" type="button" data-s="${k}">${esc(t)}</button>`).join('') : '';
+    $('suggest').querySelectorAll('[data-s]').forEach(b => b.onclick = () => sendChat(SUGGESTIONS[Number(b.dataset.s)]));
+    $('chatSend').textContent = chatBusy ? 'Stop' : 'Send';
+    $('chatSend').disabled = !sample;
+  }
+
+  async function sendChat(text) {
+    text = String(text || '').trim();
+    if (!text || chatBusy || !sample) return;
+    chat.push({ role: 'user', content: text });
+    $('chatInput').value = '';
+    const turns = [{ role: 'user', content: chatRules() }, ...chat.filter(m => !m.err && m.content).slice(-12)];
+    const reply = { role: 'assistant', content: '' };
+    chat.push(reply);
+    chatBusy = true; chatCtl = new AbortController();
+    renderChat();
+    const opts = { cache: false, signal: chatCtl.signal, onText: ({ text }) => { reply.content = text; renderChat(); } };
+    if (toolsOk) opts.tools = TOOLS;
+    try {
+      reply.content = (await sample(turns, opts)).text;
+    } catch (e) {
+      if (e.code === 'cancelled') reply.content = e.text || '(stopped)';
+      else {
+        reply.err = true;
+        reply.content = (e.text ? e.text + '\n\n' : '') + ({
+          not_granted: 'Claude is not allowed for this page.',
+          rate_limited: 'Too many requests right now. Try again in a minute.',
+          sampling_disabled: 'Claude is not available on this account.',
+        }[e.code] || 'The coach could not answer this time. Try again.');
+        if (e.code === 'not_granted' || e.code === 'sampling_disabled') sample = null;
+      }
+    }
+    chatBusy = false; chatCtl = null;
+    renderChat();
   }
 
   // ---------- Loop ----------
@@ -669,7 +834,11 @@ td.n, th.n { text-align: right; font-family: var(--f-mono); font-variant-numeric
   render(); renderTabs();
 
   if (window.claude && window.claude.use) {
-    window.claude.use('sample').then(s => { sample = s; renderCoach(); }).catch(() => {});
+    window.claude.use('sample').then(async s => {
+      sample = s;
+      if (s) { const lim = await s.limits().catch(() => null); toolsOk = !!lim?.tools; }
+      renderCoach(); renderTabs(); renderChat();
+    }).catch(() => {});
   }
 })();
 </script>
