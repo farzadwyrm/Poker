@@ -34,3 +34,14 @@ while (hands < 400) {
 }
 const s = g.players.map(p => `${p.name}: acc ${((p.stats.good + p.stats.ok / 2) / p.stats.decisions * 100).toFixed(0)}% lost ${p.stats.evLost.toFixed(0)}bb cm ${p.prof.callMargin.toFixed(2)}`);
 console.log(`OK: ${hands} hands, ${g.reviews.length} recent reviews, ${Date.now() - t0} ms\n` + s.join('\n'));
+
+// Strategy layer checks.
+assert.strictEqual(P.handKey(hand('Ks As')), 'AKs');
+assert.ok(P.handPct(hand('Ah Ad')) < 0.01 && P.handPct(hand('3c 2d')) > 0.99);
+assert.deepStrictEqual(P.draws(hand('Ah 5h'), hand('Kh 9h 2c')).names, ['flush draw']);
+assert.deepStrictEqual(P.draws(hand('8c 7d'), hand('6h 5s Kc')).names, ['open-ended straight draw']);
+assert.deepStrictEqual(P.draws(hand('8c 7d'), hand('5h 4s Kc')).names, ['gutshot straight draw']);
+assert.deepStrictEqual(P.draws(hand('Ac Kd'), hand('Qh Js 2c')).names, ['gutshot straight draw']);
+const eqRange = P.equity(hand('Qh Qd'), [], 1, 3000, [0.03]);
+assert.ok(eqRange > 0.5 && eqRange < 0.61, 'QQ vs top 3% should be ~56%, got ' + eqRange);
+console.log('Strategy checks OK');

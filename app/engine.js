@@ -1,4 +1,4 @@
-// Poker Coach AI engine: cards, hand evaluator, equity, game flow, player agents and coach.
+// Poker Coach AI engine: cards, hand evaluator, equity, strategy, game flow, player agents and coach.
 // Pure logic, no DOM. Works in the browser (window.Poker) and in Node (module.exports).
 (function (root) {
   'use strict';
@@ -15,6 +15,8 @@
   const suitOf = c => c & 3;
   const cardText = c => RANKS[rankOf(c)] + SUIT_LETTERS[suitOf(c)];
   const clamp = (x, lo, hi) => Math.max(lo, Math.min(hi, x));
+  const pct = x => Math.round(x * 100) + '%';
+  const cap = s => s[0].toUpperCase() + s.slice(1);
 
   function shuffledDeck() {
     const d = [];
@@ -83,25 +85,121 @@
 
   const categoryName = s => CATEGORIES[Math.floor(s / CAT_BASE)];
 
-  // ---------- Monte Carlo equity vs random hands ----------
+  // ---------- Starting hands and ranges ----------
+  // Ordering of the 169 starting hands, strongest first, built by tools/rank169.js
+  // (heads-up equity plus small bonuses for suited, connected and paired hands).
+  const PREFLOP_ORDER = 'AA KK QQ JJ TT 99 88 AKs AQs 77 AJs 66 ATs KQs AKo KJs A8s A9s AQo KTs A7s QJs AJo K9s 55 A5s QTs KQo ATo A6s JTs A4s K8s A3s KJo 44 A9o K7s KTo J9s Q9s A2s A7o QJo A8o Q8s K6s K9o A5o QTo T9s K4s K5s 33 Q7s A4o J8s Q6s A6o K8o JTo A3o K3s T8s K7o Q5s A2o J7s Q4s K2s 98s Q9o J9o T7s K6o Q8o Q3s 22 Q2s J6s K5o T9o K4o J5s 97s T6s Q7o J8o K3o 87s J3s Q6o J4s Q5o T8o T5s 96s J2s K2o 86s T4s J7o Q4o 76s 95s 98o Q3o T3s T7o T2s J5o J6o 97o 75s 85s Q2o 65s J4o 94s T6o 87o J3o 93s 84s 64s 92s 54s T4o T5o 86o J2o 96o 74s 76o 83s 73s 82s 53s T3o 63s 95o 43s T2o 75o 85o 72s 65o 52s 94o 42s 62s 93o 92o 32s 54o 84o 64o 74o 53o 83o 82o 63o 73o 43o 72o 52o 62o 42o 32o'.split(' ');
 
-  function equity(hole, board, nOpp, iters) {
+  // Percentile of each hand class: the share of all 1,326 combos that are this strong or stronger.
+  const PCT = {};
+  (function () {
+    let combos = 0;
+    for (const k of PREFLOP_ORDER) {
+      combos += k.length === 2 ? 6 : k[2] === 's' ? 4 : 12;
+      PCT[k] = combos / 1326;
+    }
+  })();
+
+  function handKey(hole) {
+    const [a, b] = hole[0] >> 2 >= hole[1] >> 2 ? hole : [hole[1], hole[0]];
+    const ra = RANKS[a >> 2], rb = RANKS[b >> 2];
+    if (ra === rb) return ra + rb;
+    return ra + rb + ((a & 3) === (b & 3) ? 's' : 'o');
+  }
+  const handPct = hole => PCT[handKey(hole)];
+
+  // All 1,326 two-card combos sorted strongest first, so a range is a prefix of this list.
+  const COMBOS = [];
+  for (let a = 0; a < 52; a++) for (let b = a + 1; b < 52; b++) COMBOS.push([a, b, PCT[handKey([a, b])]]);
+  COMBOS.sort((x, y) => x[2] - y[2]);
+  function rangeSize(lim) {
+    let lo = 0, hi = COMBOS.length;
+    while (lo < hi) { const m = (lo + hi) >> 1; if (COMBOS[m][2] <= lim + 1e-9) lo = m + 1; else hi = m; }
+    return Math.max(lo, 6);
+  }
+
+  // Positions at a 7-handed table, by offset from the dealer button.
+  const POS_BY_OFFSET = ['BTN', 'SB', 'BB', 'UTG', 'MP', 'HJ', 'CO'];
+  const POS_NAMES = { BTN: 'Button', SB: 'Small blind', BB: 'Big blind', UTG: 'Under the gun', MP: 'Middle position', HJ: 'Hijack', CO: 'Cutoff' };
+  // Approximate solver opening ranges (share of hands raised first in), adapted from 6-max 100bb charts.
+  const OPEN = { UTG: 0.15, MP: 0.18, HJ: 0.22, CO: 0.28, BTN: 0.44, SB: 0.38, BB: 0.15 };
+  const postflopOrder = pos => (POS_BY_OFFSET.indexOf(pos) + 6) % 7; // SB acts first, BTN last
+
+  // ---------- Board reading ----------
+
+  function texture(board) {
+    if (board.length < 3) return 'none';
+    const suits = [0, 0, 0, 0];
+    board.forEach(c => suits[c & 3]++);
+    const rs = [...new Set(board.map(rankOf))].sort((a, b) => a - b);
+    let connected = false;
+    for (let i = 0; i + 2 < rs.length; i++) if (rs[i + 2] - rs[i] <= 4) connected = true;
+    return Math.max(...suits) >= 2 || connected ? 'wet' : 'dry';
+  }
+
+  // Draws the hero holds (using at least one hole card) and their outs.
+  function draws(hole, board) {
+    if (board.length < 3 || board.length > 4) return { outs: 0, names: [] };
+    const all = hole.concat(board);
+    const names = [];
+    let outs = 0;
+    for (let s = 0; s < 4; s++) {
+      const n = all.filter(c => (c & 3) === s).length;
+      if (n === 4 && hole.some(c => (c & 3) === s)) { names.push('flush draw'); outs += 9; }
+    }
+    if (score(all) < 4 * CAT_BASE) {
+      let mask = 0;
+      all.forEach(c => { mask |= 1 << rankOf(c); });
+      const ext = (mask << 1) | ((mask >> 12) & 1); // bit 0 = ace low
+      let open = false, gut = false;
+      for (let st = 0; st <= 10; st++) {
+        if (((ext >> st) & 15) === 15) { if (st >= 1 && st + 4 <= 13) open = true; else gut = true; }
+      }
+      for (let lo = 0; lo <= 9 && !open && !gut; lo++) {
+        const win = (ext >> lo) & 31;
+        if ([0, 1, 2, 3, 4].filter(i => (win >> i) & 1).length === 4) gut = true;
+      }
+      if (open) { names.push('open-ended straight draw'); outs += 8; }
+      else if (gut) { names.push('gutshot straight draw'); outs += 4; }
+    }
+    if (names.length === 2) outs -= 2; // shared outs between flush and straight draws
+    return { outs, names };
+  }
+
+  // ---------- Equity ----------
+
+  // Monte Carlo equity. ranges: optional array of percentile limits, one per opponent;
+  // each opponent is dealt a random hand within its range (rejection sampling).
+  function equity(hole, board, nOpp, iters, ranges) {
     if (nOpp <= 0) return 1;
     const used = new Set(hole.concat(board));
     const deck = [];
     for (let c = 0; c < 52; c++) if (!used.has(c)) deck.push(c);
-    const need = nOpp * 2 + (5 - board.length);
+    const L = deck.length;
     let won = 0;
+    const taken = new Uint8Array(52);
     for (let i = 0; i < iters; i++) {
-      for (let k = 0; k < need; k++) {
-        const j = k + Math.floor(Math.random() * (deck.length - k));
-        const t = deck[k]; deck[k] = deck[j]; deck[j] = t;
+      taken.fill(0);
+      const opp = [];
+      for (let o = 0; o < nOpp; o++) {
+        const size = ranges && ranges[o] < 1 ? rangeSize(ranges[o]) : COMBOS.length;
+        let a, b, tries = 0;
+        do {
+          const pick = COMBOS[Math.floor(Math.random() * (tries < 60 ? size : COMBOS.length))];
+          a = pick[0]; b = pick[1]; tries++;
+        } while (taken[a] || taken[b] || used.has(a) || used.has(b));
+        taken[a] = taken[b] = 1;
+        opp.push(a, b);
       }
-      const full = board.concat(deck.slice(nOpp * 2, need));
+      const full = board.slice();
+      while (full.length < 5) {
+        const c = deck[Math.floor(Math.random() * L)];
+        if (!taken[c]) { taken[c] = 1; full.push(c); }
+      }
       const mine = score(hole.concat(full));
       let ties = 0, lost = false;
       for (let o = 0; o < nOpp && !lost; o++) {
-        const s = score([deck[2 * o], deck[2 * o + 1]].concat(full));
+        const s = score([opp[2 * o], opp[2 * o + 1]].concat(full));
         if (s > mine) lost = true;
         else if (s === mine) ties++;
       }
@@ -110,131 +208,265 @@
     return won / iters;
   }
 
+  // Range each opponent is likely to hold, read from their public actions only.
+  function rangeFor(seat, view) {
+    let r = 1, raises = 0;
+    for (const a of view.actions) {
+      if (a.street === 'preflop') {
+        if (a.type === 'raise') {
+          if (a.seat === seat) r = raises === 0 ? (OPEN[view.posOf[seat]] || 0.15) : raises === 1 ? 0.08 : 0.03;
+          raises++;
+        } else if (a.type === 'call' && a.seat === seat) {
+          r = raises === 0 ? 0.5 : raises === 1 ? 0.28 : 0.08;
+        }
+      } else if (a.seat === seat) {
+        if (a.type === 'raise') r *= 0.6;
+        else if (a.type === 'call') r *= 0.8;
+      }
+    }
+    return Math.max(0.02, r);
+  }
+
+  // ---------- Strategy (the coach's baseline; v2 can swap in a solver table here) ----------
+
+  const fairShare = n => 1 / (n + 1);
+  const valueThreshold = n => fairShare(n) + (1 - fairShare(n)) * 0.3;
+
+  function preflopPlan(v, pctAdj) {
+    const p = pctAdj ?? handPct(v.hole);
+    const pre = v.actions.filter(a => a.street === 'preflop');
+    const raisesList = pre.filter(a => a.type === 'raise');
+    const limpers = pre.filter(a => a.type === 'call').length;
+    const key = handKey(v.hole), pos = v.pos;
+    const top = `${key} is in the top ${pct(p)} of starting hands`;
+    let rec, accept, raiseTo = 0, reason, concept;
+
+    if (raisesList.length === 0) {
+      const open = OPEN[pos];
+      raiseTo = BB * (pos === 'SB' ? 3 : 2.5) + limpers * BB;
+      if (v.toCall === 0) { // big blind option
+        rec = p <= 0.25 ? 'raise' : 'check';
+        reason = rec === 'raise' ? `${top}. Raise the limpers for value.` : `${top}. Check and see a free flop.`;
+        concept = 'position';
+      } else if (p <= open) {
+        rec = 'raise';
+        reason = `From the ${POS_NAMES[pos].toLowerCase()}, a solid strategy opens about ${pct(open)} of hands. ${top}, so raise to ${raiseTo}.`;
+        concept = 'ranges';
+      } else {
+        rec = 'fold';
+        reason = `From the ${POS_NAMES[pos].toLowerCase()}, open only about the top ${pct(open)}. ${top}, so fold.`;
+        concept = 'ranges';
+      }
+      accept = [rec];
+    } else {
+      const last = raisesList[raisesList.length - 1];
+      const raiserPos = v.posOf[last.seat];
+      const ip = postflopOrder(pos) > postflopOrder(raiserPos);
+      if (raisesList.length === 1) {
+        const rr = OPEN[raiserPos] || 0.15;
+        const threeBet = Math.max(0.03, rr * 0.3);
+        let callR = pos === 'BB' ? Math.min(0.55, rr * 1.5) : pos === 'SB' ? rr * 0.5 : ip ? rr * 0.75 : rr * 0.6;
+        if (pre.filter(a => a.type === 'call').length) callR *= 0.85;
+        raiseTo = Math.round(v.currentBet * (ip ? 3 : 4) / 10) * 10;
+        if (p <= threeBet) { rec = 'raise'; reason = `${top}, strong enough to re-raise (3-bet) an opener from ${raiserPos} to ${raiseTo}.`; }
+        else if (p <= callR) { rec = 'call'; reason = `${top}. Against a ${raiserPos} open (about ${pct(rr)} of hands) this is a call${ip ? ', helped by acting last after the flop' : ''}.`; }
+        else { rec = 'fold'; reason = `A ${raiserPos} opener holds about the top ${pct(rr)}. ${top}, which plays poorly against that range. Fold.`; }
+        concept = 'ranges';
+      } else if (raisesList.length === 2) {
+        raiseTo = Math.round(v.currentBet * 2.3 / 10) * 10;
+        if (p <= 0.025) { rec = 'raise'; reason = `${top}. Facing a 3-bet, 4-bet the very best hands.`; }
+        else if (p <= 0.08) { rec = 'call'; reason = `${top}. Strong enough to call a 3-bet, not to 4-bet.`; }
+        else { rec = 'fold'; reason = `A 3-bet range is narrow, around the top 8%. ${top}. Fold.`; }
+        concept = 'ranges';
+      } else {
+        raiseTo = v.maxTo;
+        if (p <= 0.02) { rec = 'raise'; reason = `${top}. Against a 4-bet, only premium pairs and AK continue, and this one goes all-in.`; }
+        else if (p <= 0.035) { rec = 'call'; reason = `${top}. Just good enough to call a 4-bet.`; }
+        else { rec = 'fold'; reason = `A 4-bet range is the top 2–3% of hands. ${top}. Fold.`; }
+        concept = 'ranges';
+      }
+      accept = [rec];
+      if (rec === 'raise') accept.push('call');
+    }
+    if (rec === 'raise' && !v.canRaise) { rec = v.toCall > 0 ? 'call' : 'check'; accept = [rec]; }
+    return { rec, accept, raiseTo: clamp(raiseTo, Math.min(v.minTo, v.maxTo), v.maxTo), reason, concept, handPct: p };
+  }
+
+  function postflopPlan(v, eq) {
+    const n = v.nOpp;
+    const required = v.toCall > 0 ? v.toCall / (v.pot + v.toCall) : 0;
+    const valueT = valueThreshold(n);
+    const tex = texture(v.board);
+    const dr = draws(v.hole, v.board);
+    const eqTxt = `about ${pct(eq)} equity against the hands your opponent${n === 1 ? '' : 's'} likely hold${n === 1 ? 's' : ''}`;
+    const drawTxt = dr.names.length ? ` You have a ${dr.names.join(' and ')} (${dr.outs} outs).` : '';
+    let rec, accept, raiseTo = 0, reason, concept;
+
+    if (v.toCall === 0) {
+      const frac = tex === 'wet' ? 0.66 : 0.33;
+      raiseTo = Math.max(BB, Math.round(v.pot * frac / 10) * 10);
+      if (eq >= valueT && v.canRaise) {
+        rec = 'raise'; accept = ['raise'];
+        reason = `You have ${eqTxt}, enough to bet for value. On a ${tex} board, bet about ${Math.round(frac * 100)}% of the pot (${raiseTo}).`;
+        concept = 'sizing';
+      } else if (v.aggressor === v.seat && v.street === 'flop' && n === 1 && tex === 'dry' && v.canRaise) {
+        rec = 'raise'; accept = ['raise', 'check']; raiseTo = Math.max(BB, Math.round(v.pot * 0.33 / 10) * 10);
+        reason = `You raised before the flop, and this dry board favours your range. A small continuation bet (${raiseTo}, a third of the pot) works with much of your range. Checking is also fine.`;
+        concept = 'cbet';
+      } else if (dr.outs >= 8 && n <= 2 && v.canRaise) {
+        rec = 'raise'; accept = ['raise', 'check']; raiseTo = Math.max(BB, Math.round(v.pot * 0.5 / 10) * 10);
+        reason = `You have ${eqTxt}.${drawTxt} A semi-bluff bet of ${raiseTo} can win now or improve later. Checking is also fine.`;
+        concept = 'draws';
+      } else {
+        rec = 'check'; accept = ['check'];
+        reason = `You have ${eqTxt}.${drawTxt} Not strong enough to bet for value, so check.`;
+        concept = 'equity';
+      }
+    } else {
+      const potBefore = v.pot - v.toCall, mdf = potBefore / (potBefore + v.toCall);
+      raiseTo = Math.round(v.currentBet * 3 / 10) * 10;
+      const odds = `Calling ${v.toCall} to win ${v.pot + v.toCall} needs ${pct(required)} equity`;
+      if (eq >= valueT + 0.12 && v.canRaise) {
+        rec = 'raise'; accept = ['raise', 'call'];
+        reason = `You have ${eqTxt}, well ahead. Raise to about ${raiseTo} for value; calling is also fine.`;
+        concept = 'sizing';
+      } else if (eq >= required) {
+        rec = 'call'; accept = ['call'];
+        if (dr.outs >= 8 && v.canRaise) accept.push('raise');
+        reason = `${odds}, and you have ${eqTxt}.${drawTxt} Call.`;
+        concept = 'potodds';
+      } else {
+        rec = 'fold'; accept = ['fold'];
+        reason = `${odds}, but you have only ${eqTxt}.${drawTxt} Against this bet you only need to defend ${pct(mdf)} of your range; this hand is in the part that folds.`;
+        concept = 'mdf';
+      }
+    }
+    if (rec === 'raise' && !v.canRaise) { rec = v.toCall > 0 ? 'call' : 'check'; accept = [rec]; }
+    return { rec, accept, raiseTo: clamp(raiseTo, Math.min(v.minTo, v.maxTo), v.maxTo), reason, concept, required, draws: dr, texture: tex };
+  }
+
   // ---------- Coach ----------
   // The coach only ever receives a view from Game.coachView(seat): the acting player's
   // own cards plus public table information. It never sees other players' cards.
 
   const LEARN_RATE = 0.01;
 
-  function Coach() {
-    this.cache = new Map();
-  }
+  function Coach() { this.cache = new Map(); }
 
-  Coach.prototype.equity = function (hole, board, nOpp) {
-    const key = hole.slice().sort().join(',') + '|' + board.join(',') + '|' + nOpp;
+  Coach.prototype.equity = function (v) {
+    const ranges = v.opponents.map(o => rangeFor(o.seat, v));
+    const key = v.hole.slice().sort().join(',') + '|' + v.board.join(',') + '|' + ranges.map(r => r.toFixed(3)).join(',');
     let eq = this.cache.get(key);
     if (eq === undefined) {
       if (this.cache.size > 4000) this.cache.clear();
-      eq = equity(hole, board, nOpp, 600);
+      eq = equity(v.hole, v.board, v.nOpp, 700, ranges);
       this.cache.set(key, eq);
     }
     return eq;
   };
 
-  // Value-raise threshold: a share of the gap between a fair share of the pot and certainty.
-  const raiseThreshold = nOpp => {
-    const fair = 1 / (nOpp + 1);
-    return fair + (1 - fair) * 0.35;
-  };
-
   Coach.prototype.advise = function (v) {
-    const eq = this.equity(v.hole, v.board, v.nOpp);
+    const eq = this.equity(v);
     const required = v.toCall > 0 ? v.toCall / (v.pot + v.toCall) : 0;
-    const raiseT = raiseThreshold(v.nOpp);
-    let rec;
-    if (eq >= raiseT && v.canRaise) rec = 'raise';
-    else if (v.toCall === 0) rec = 'check';
-    else if (eq >= required) rec = 'call';
-    else rec = 'fold';
-    return { eq, required, raiseT, rec, evCall: eq * (v.pot + v.toCall) - v.toCall };
+    const plan = v.street === 'preflop' ? preflopPlan(v) : postflopPlan(v, eq);
+    return { ...plan, eq, required, evCall: eq * (v.pot + v.toCall) - v.toCall };
   };
 
-  const pct = x => Math.round(x * 100) + '%';
+  const LEAK = {
+    looseFold: 'Plays too many hands preflop', tightFold: 'Folds playable hands preflop',
+    foldOdds: 'Folds with the odds to call', callNoOdds: 'Calls without the odds',
+    missValue: 'Misses value bets', weakRaise: 'Raises weak hands into bets', freeFold: 'Folds when checking is free',
+  };
 
   Coach.prototype.review = function (v, d, adv) {
-    const A = d.action, R = adv.rec, bb = v.bb;
-    const eqTxt = `${pct(adv.eq)} to win against ${v.nOpp} opponent${v.nOpp === 1 ? '' : 's'}`;
-    const betWord = v.toCall > 0 ? 'raise' : 'bet';
-    let grade = 'good', loss = 0, note, leak = null;
+    const A = d.action, R = adv.rec, bb = v.bb, pre = v.street === 'preflop';
+    const put = A === 'call' ? v.toCall : A === 'raise' ? d.raiseTo - v.myBet : 0;
+    const word = a => a === 'raise' ? (v.toCall > 0 ? 'raise' : 'bet') : a;
+    let grade = 'good', loss = 0, note, leak = null, concept = adv.concept;
     const lesson = [];
 
-    if (A === R) {
-      note = {
-        fold: `Good fold. You had ${eqTxt} and needed ${pct(adv.required)} to call.`,
-        check: `Good check. With ${eqTxt}, keep the pot small.`,
-        call: `Good call. You had ${eqTxt} and needed only ${pct(adv.required)}.`,
-        raise: `Good ${betWord}. ${cap(eqTxt)} is well ahead of a fair share.`,
-      }[A];
+    if (adv.accept.includes(A)) {
+      note = A === R ? adv.reason : `Fine. The coach prefers to ${word(R)}, but ${word(A)} is also part of a sound strategy here. ${adv.reason}`;
+    } else if (A === 'fold' && v.toCall === 0) {
+      grade = 'blunder'; loss = adv.eq * v.pot / bb; leak = LEAK.freeFold;
+      note = 'You folded when checking was free. Never fold when nothing is owed.';
+    } else if (pre) {
+      if (A === 'fold') {
+        loss = adv.handPct < 0.06 ? 3 : 0.6;
+        grade = 'mistake'; leak = LEAK.tightFold;
+        note = `Too tight. ${adv.reason}`;
+        lesson.push(['openMult', 0.03]);
+      } else if (R === 'fold') {
+        loss = Math.min(put / bb, 6) * 0.35;
+        grade = 'mistake'; leak = LEAK.looseFold;
+        note = `Too loose. ${adv.reason}`;
+        lesson.push(['openMult', -0.03]);
+      } else {
+        grade = 'ok';
+        note = A === 'call' ? `A raise is better here. ${adv.reason}` : `A call is enough here. ${adv.reason}`;
+        if (A === 'call') leak = LEAK.missValue;
+      }
     } else if (A === 'fold') {
-      if (v.toCall === 0) {
-        grade = 'blunder'; loss = adv.eq * v.pot / bb;
-        note = 'Folded when checking was free. Never fold when nothing is owed.';
-        leak = 'Folds when checking is free';
-      } else {
-        loss = Math.max(0, adv.evCall) / bb;
-        grade = loss > 6 ? 'blunder' : 'mistake';
-        note = `Folded with ${eqTxt}, but only ${pct(adv.required)} was needed to call.`;
-        lesson.push(['callMargin', -LEARN_RATE]);
-        if (R === 'raise') lesson.push(['raiseOffset', -LEARN_RATE / 2]);
-        leak = 'Folds with the odds to call';
-      }
-    } else if (A === 'call') {
-      if (R === 'fold') {
-        loss = Math.max(0, -adv.evCall) / bb;
-        grade = loss > 6 ? 'blunder' : 'mistake';
-        note = `Called with ${eqTxt}, but needed ${pct(adv.required)}. Folding was cheaper.`;
-        lesson.push(['callMargin', LEARN_RATE]);
-        leak = 'Calls without the odds';
-      } else {
-        grade = 'ok';
-        note = `Strong spot: ${eqTxt}. A raise builds the pot while you are ahead.`;
-        lesson.push(['raiseOffset', -LEARN_RATE / 2]);
-        leak = 'Misses value raises';
-      }
-    } else if (A === 'check') {
-      grade = 'ok';
-      note = `Checked with ${eqTxt}. A bet gets value from weaker hands.`;
+      loss = Math.max(0, adv.evCall) / bb;
+      grade = loss > 6 ? 'blunder' : 'mistake'; leak = LEAK.foldOdds;
+      note = `Folded with enough equity to continue. ${adv.reason}`;
+      lesson.push(['callMargin', -LEARN_RATE]);
+    } else if (A === 'call' && R === 'fold') {
+      loss = Math.max(0, -adv.evCall) / bb;
+      grade = loss > 6 ? 'blunder' : 'mistake'; leak = LEAK.callNoOdds;
+      note = `Called without the odds. ${adv.reason}`;
+      lesson.push(['callMargin', LEARN_RATE]);
+    } else if ((A === 'call' || A === 'check') && R === 'raise') {
+      grade = 'ok'; leak = LEAK.missValue;
+      note = `Missed value. ${adv.reason}`;
       lesson.push(['raiseOffset', -LEARN_RATE / 2]);
-      leak = 'Misses value bets';
-    } else if (A === 'raise') {
-      if (R === 'call') {
-        grade = 'ok';
-        note = `Raised with ${eqTxt}. Calling was enough here; the raise is optional.`;
-        lesson.push(['raiseOffset', LEARN_RATE / 3]);
-      } else if (R === 'check') {
-        grade = 'ok';
-        note = d.intent === 'bluff'
-          ? `Bluffed with ${eqTxt}. Fine now and then, costly if overused.`
-          : `Bet with only ${eqTxt}. Checking keeps the pot small with a medium hand.`;
-        lesson.push(d.intent === 'bluff' ? ['bluff', -LEARN_RATE / 4] : ['raiseOffset', LEARN_RATE / 2]);
-      } else {
-        const put = d.raiseTo - v.myBet;
-        const finalPot = v.pot + put + (d.raiseTo - v.currentBet);
-        const evIfCalled = adv.eq * finalPot - put;
-        loss = Math.max(0, -evIfCalled) * 0.5 / bb; // half credit for fold equity
-        grade = loss > 6 ? 'blunder' : 'mistake';
-        note = `Raised with ${eqTxt} while facing a bet that needed ${pct(adv.required)}. Folding was cheaper.`;
-        lesson.push(d.intent === 'bluff' ? ['bluff', -LEARN_RATE / 2] : ['raiseOffset', LEARN_RATE]);
-        leak = 'Raises weak hands into bets';
-      }
+    } else if (A === 'raise' && R === 'check') {
+      grade = 'ok'; concept = 'valueBluff';
+      note = d.intent === 'bluff'
+        ? `A bluff. Fine now and then; a bet of this size needs to work about ${pct(put / (v.pot + put))} of the time to profit. ${adv.reason}`
+        : `Betting a medium hand turns it into a bluff. ${adv.reason}`;
+      lesson.push(d.intent === 'bluff' ? ['bluff', -LEARN_RATE / 4] : ['raiseOffset', LEARN_RATE / 2]);
+    } else if (A === 'raise' && R === 'call') {
+      grade = 'ok';
+      note = `Raising is optional here; calling keeps weaker hands in. ${adv.reason}`;
+      lesson.push(['raiseOffset', LEARN_RATE / 3]);
+    } else { // raise facing a bet when the plan says fold
+      const finalPot = v.pot + put + (d.raiseTo - v.currentBet);
+      loss = Math.max(0, -(adv.eq * finalPot - put)) * 0.5 / bb; // half credit for fold equity
+      grade = loss > 6 ? 'blunder' : 'mistake'; leak = LEAK.weakRaise;
+      note = `Raised with a hand that should fold. ${adv.reason}`;
+      lesson.push(d.intent === 'bluff' ? ['bluff', -LEARN_RATE / 2] : ['raiseOffset', LEARN_RATE]);
     }
-    return { grade, loss: Math.round(loss * 10) / 10, note, lesson, leak };
+    return { grade, loss: Math.round(loss * 10) / 10, note, lesson, leak, concept };
   };
 
-  function cap(s) { return s[0].toUpperCase() + s.slice(1); }
+  // Concept library the coach links its lessons to.
+  const CONCEPTS = {
+    position: { title: 'Position', text: 'Acting after your opponents shows you their move before you decide. Play more hands from the cutoff and button, fewer from early seats.' },
+    ranges: { title: 'Ranges', text: 'Think in ranges: the set of hands a player could hold given their actions. Solver charts open about 15% of hands under the gun and over 40% on the button.' },
+    potodds: { title: 'Pot odds', text: 'Divide the call by the pot after you call. Calling 20 to win 80 needs 25% equity. Call when your equity is higher.' },
+    equity: { title: 'Equity', text: 'Your share of the pot if all cards were dealt out, measured against the hands your opponents likely hold.' },
+    mdf: { title: 'Minimum defense frequency', text: 'Facing a bet B into a pot P, keep playing about P / (P + B) of your range or the bettor profits with any two cards. Half-pot bet: defend 67%. Pot-size bet: defend 50%.' },
+    cbet: { title: 'Continuation bet', text: 'The preflop raiser can often bet small on dry, high-card flops because those boards hit the raiser\'s range more.' },
+    sizing: { title: 'Bet sizing', text: 'Small bets (a third of the pot) suit dry boards and wide ranges. Larger bets (two thirds or more) suit wet boards and strong, polarized ranges.' },
+    valueBluff: { title: 'Value and bluffs', text: 'A bluff needs folds as often as bet / (pot + bet). Rough balance: one bluff per three value bets at a third-pot size, one per one at pot size.' },
+    draws: { title: 'Draws and outs', text: 'Outs are cards that make your hand. Rule of 2 and 4: outs × 2 is your chance on the next card, outs × 4 by the river from the flop.' },
+    exploit: { title: 'GTO and exploits', text: 'GTO play is hard to beat but does not punish leaks. Against a player who calls too much, bluff less and bet bigger for value.' },
+  };
 
   // ---------- Player agents ----------
 
   const PROFILES = [
-    { name: 'Juno', style: 'Novice', callMargin: 0.06, raiseOffset: 0.06, bluff: 0.10, aggr: 0.5, noise: 0.16 },
-    { name: 'Mira', style: 'Tight-aggressive', callMargin: 0.03, raiseOffset: 0.00, bluff: 0.08, aggr: 0.8, noise: 0.03 },
-    { name: 'Dex', style: 'Loose-aggressive', callMargin: -0.06, raiseOffset: -0.08, bluff: 0.25, aggr: 0.9, noise: 0.06 },
-    { name: 'Otto', style: 'Calling station', callMargin: -0.12, raiseOffset: 0.12, bluff: 0.02, aggr: 0.2, noise: 0.08 },
-    { name: 'Rosa', style: 'Rock', callMargin: 0.12, raiseOffset: 0.08, bluff: 0.01, aggr: 0.5, noise: 0.04 },
-    { name: 'Kai', style: 'Maniac', callMargin: -0.10, raiseOffset: -0.15, bluff: 0.40, aggr: 1.0, noise: 0.10 },
-    { name: 'Theo', style: 'Balanced', callMargin: 0.00, raiseOffset: 0.00, bluff: 0.10, aggr: 0.6, noise: 0.03 },
+    { name: 'Juno', style: 'Novice', openMult: 1.3, callMargin: 0.06, raiseOffset: 0.06, bluff: 0.10, aggr: 0.5, noise: 0.16 },
+    { name: 'Mira', style: 'Tight-aggressive', openMult: 1.0, callMargin: 0.03, raiseOffset: 0.00, bluff: 0.08, aggr: 0.8, noise: 0.03 },
+    { name: 'Dex', style: 'Loose-aggressive', openMult: 1.45, callMargin: -0.06, raiseOffset: -0.08, bluff: 0.25, aggr: 0.9, noise: 0.06 },
+    { name: 'Otto', style: 'Calling station', openMult: 1.7, callMargin: -0.12, raiseOffset: 0.12, bluff: 0.02, aggr: 0.15, noise: 0.08 },
+    { name: 'Rosa', style: 'Rock', openMult: 0.6, callMargin: 0.12, raiseOffset: 0.08, bluff: 0.01, aggr: 0.5, noise: 0.04 },
+    { name: 'Kai', style: 'Maniac', openMult: 1.9, callMargin: -0.10, raiseOffset: -0.15, bluff: 0.40, aggr: 1.0, noise: 0.10 },
+    { name: 'Theo', style: 'Balanced', openMult: 1.0, callMargin: 0.00, raiseOffset: 0.00, bluff: 0.10, aggr: 0.6, noise: 0.03 },
   ];
-  const PARAM_RANGE = { callMargin: [-0.2, 0.25], raiseOffset: [-0.2, 0.25], bluff: [0, 0.5] };
+  const PARAM_RANGE = { openMult: [0.5, 2.2], callMargin: [-0.2, 0.25], raiseOffset: [-0.2, 0.25], bluff: [0, 0.5] };
+  const PARAM_KEYS = ['openMult', 'callMargin', 'raiseOffset', 'bluff', 'aggr', 'noise'];
 
   function gauss() {
     let u = 0, v = 0;
@@ -243,27 +475,38 @@
     return Math.sqrt(-2 * Math.log(u)) * Math.cos(2 * Math.PI * v);
   }
 
-  // A player agent decides from the same limited view the coach gets, using a cheaper,
-  // noisier equity read and its own style settings.
+  // Player agents use the same strategy layer and the same limited view as the coach,
+  // bent by their style and a noisier, cheaper equity read.
   function botDecide(v, prof) {
-    const est = clamp(equity(v.hole, v.board, v.nOpp, 160) + gauss() * prof.noise, 0, 1);
+    const sizeOr = plan => ({ action: 'raise', raiseTo: plan.raiseTo });
+    if (v.street === 'preflop') {
+      const p = clamp(handPct(v.hole) / prof.openMult * Math.exp(gauss() * prof.noise * 2), 0, 1);
+      const plan = preflopPlan(v, p);
+      if (plan.rec === 'raise') return Math.random() < 0.35 + 0.65 * prof.aggr ? { ...sizeOr(plan), intent: 'value' } : { action: v.toCall ? 'call' : 'check' };
+      if (plan.rec === 'fold' && v.canRaise && Math.random() < prof.bluff * 0.25) {
+        return { action: 'raise', raiseTo: clamp(v.currentBet * 3, Math.min(v.minTo, v.maxTo), v.maxTo), intent: 'bluff' };
+      }
+      if (plan.rec === 'fold' && v.toCall > 0 && v.toCall <= BB && Math.random() < -prof.callMargin * 2) return { action: 'call' };
+      return { action: plan.rec };
+    }
+    const ranges = v.opponents.map(o => rangeFor(o.seat, v));
+    const est = clamp(equity(v.hole, v.board, v.nOpp, 160, ranges) + gauss() * prof.noise, 0, 1);
+    const plan = postflopPlan(v, est);
     const required = v.toCall > 0 ? v.toCall / (v.pot + v.toCall) : 0;
-    const raiseT = raiseThreshold(v.nOpp) + prof.raiseOffset;
-    const size = () => {
-      let to = v.currentBet + Math.max(v.minRaise, Math.round(v.pot * (0.45 + 0.55 * prof.aggr) / BB) * BB);
-      if (est > 0.8 && Math.random() < prof.aggr * 0.25) to = v.maxTo;
-      return clamp(to, Math.min(v.minTo, v.maxTo), v.maxTo);
-    };
-    if (v.canRaise && est >= raiseT && Math.random() < 0.45 + 0.55 * prof.aggr) {
-      return { action: 'raise', raiseTo: size(), intent: 'value' };
+    const valueT = valueThreshold(v.nOpp) + prof.raiseOffset;
+    if (v.canRaise && est >= valueT && Math.random() < 0.45 + 0.55 * prof.aggr) {
+      let to = v.toCall ? plan.raiseTo || v.currentBet * 3 : Math.round(v.pot * (0.33 + 0.5 * prof.aggr) / 10) * 10;
+      if (est > 0.85 && Math.random() < prof.aggr * 0.25) to = v.maxTo;
+      return { action: 'raise', raiseTo: clamp(to, Math.min(v.minTo, v.maxTo), v.maxTo), intent: 'value' };
     }
     if (v.toCall === 0) {
-      const bluffP = prof.bluff * (v.street === 'preflop' ? 0.3 : 1);
-      if (v.canRaise && Math.random() < bluffP) return { action: 'raise', raiseTo: size(), intent: 'bluff' };
+      if (plan.rec === 'raise' && v.canRaise && Math.random() < 0.5 + 0.5 * prof.aggr) return { ...sizeOr(plan), intent: plan.concept === 'cbet' ? 'cbet' : 'bluff' };
+      const bluffP = prof.bluff * (v.street === 'river' ? 0.7 : 1);
+      if (v.canRaise && Math.random() < bluffP) return { action: 'raise', raiseTo: clamp(Math.round(v.pot * 0.5 / 10) * 10, Math.min(v.minTo, v.maxTo), v.maxTo), intent: 'bluff' };
       return { action: 'check' };
     }
     if (est >= required + prof.callMargin) return { action: 'call' };
-    if (v.canRaise && Math.random() < prof.bluff * 0.15) return { action: 'raise', raiseTo: size(), intent: 'bluff' };
+    if (v.canRaise && Math.random() < prof.bluff * 0.15) return { action: 'raise', raiseTo: clamp(v.currentBet * 3, Math.min(v.minTo, v.maxTo), v.maxTo), intent: 'bluff' };
     return { action: 'fold' };
   }
 
@@ -273,15 +516,15 @@
     this.players = PROFILES.map((pr, seat) => ({
       seat, name: pr.name, style: pr.style,
       startProf: { ...pr },
-      prof: { callMargin: pr.callMargin, raiseOffset: pr.raiseOffset, bluff: pr.bluff, aggr: pr.aggr, noise: pr.noise },
+      prof: Object.fromEntries(PARAM_KEYS.map(k => [k, pr[k]])),
       chips: START, rebuys: 0, hole: [], bet: 0, totalIn: 0,
-      folded: false, allIn: false, acted: false, human: false, showed: false, vpipHand: false, lastAction: '',
-      stats: { hands: 0, vpip: 0, decisions: 0, good: 0, ok: 0, mistakes: 0, evLost: 0, trail: [], leaks: {} },
+      folded: false, allIn: false, acted: false, human: false, showed: false, vpipHand: false, pfrHand: false, lastAction: '',
+      stats: { hands: 0, vpip: 0, pfr: 0, decisions: 0, good: 0, ok: 0, mistakes: 0, evLost: 0, trail: [], leaks: {}, concepts: {} },
     }));
     this.coach = new Coach();
     this.dealer = -1; this.handNo = 0; this.street = 'idle';
     this.board = []; this.deck = []; this.currentBet = 0; this.minRaise = BB; this.toAct = -1;
-    this.actions = []; this.reviews = []; this.learning = true; this.lastResult = null;
+    this.actions = []; this.reviews = []; this.learning = true; this.lastResult = null; this.aggressor = -1;
     this.reviewSeq = 0;
   }
 
@@ -289,6 +532,7 @@
   G.N = PROFILES.length;
   G.pot = function () { return this.players.reduce((s, p) => s + p.totalIn, 0); };
   G.live = function () { return this.players.filter(p => !p.folded); };
+  G.posOf = function (seat) { return POS_BY_OFFSET[(seat - this.dealer + this.N) % this.N]; };
   const canAct = p => !p.folded && !p.allIn;
 
   G.findNext = function (from) {
@@ -306,15 +550,19 @@
     return a;
   };
 
+  G.log = function (p, type, text, to) {
+    this.actions.push({ seat: p.seat, name: p.name, street: this.street, type, to: to || 0, text: `${p.name} ${text}` });
+  };
+
   G.startHand = function () {
     this.handNo++;
     for (const p of this.players) {
-      if (p.chips < BB) { p.chips = START; p.rebuys++; }
-      Object.assign(p, { hole: [], bet: 0, totalIn: 0, folded: false, allIn: false, acted: false, showed: false, vpipHand: false, lastAction: '' });
+      if (p.chips < BB) { p.chips += START; p.rebuys++; }
+      Object.assign(p, { hole: [], bet: 0, totalIn: 0, folded: false, allIn: false, acted: false, showed: false, vpipHand: false, pfrHand: false, lastAction: '' });
     }
     this.dealer = (this.dealer + 1) % this.N;
     this.deck = shuffledDeck();
-    this.board = []; this.actions = []; this.lastResult = null;
+    this.board = []; this.actions = []; this.lastResult = null; this.aggressor = -1;
     this.street = 'preflop'; this.currentBet = 0; this.minRaise = BB;
     for (let r = 0; r < 2; r++) for (let k = 1; k <= this.N; k++) this.players[(this.dealer + k) % this.N].hole.push(this.deck.pop());
     const sbSeat = (this.dealer + 1) % this.N, bbSeat = (this.dealer + 2) % this.N;
@@ -322,7 +570,7 @@
     this.put(sbP, SB); sbP.lastAction = 'Small blind';
     this.put(bbP, BB); bbP.lastAction = 'Big blind';
     this.currentBet = BB;
-    this.actions.push({ street: 'preflop', text: `${sbP.name} posts ${SB}` }, { street: 'preflop', text: `${bbP.name} posts ${BB}` });
+    this.log(sbP, 'post', `posts ${SB}`); this.log(bbP, 'post', `posts ${BB}`);
     this.toAct = this.findNext(bbSeat);
   };
 
@@ -332,15 +580,18 @@
     const toCall = Math.min(this.currentBet - p.bet, p.chips);
     const others = this.players.filter(q => q !== p && !q.folded);
     const maxTo = p.bet + p.chips;
+    const posOf = {};
+    for (const q of this.players) posOf[q.seat] = this.posOf(q.seat);
     return {
-      hand: this.handNo, street: this.street, bb: BB,
+      seat, hand: this.handNo, street: this.street, bb: BB, pos: posOf[seat], posOf,
       hole: p.hole.slice(), board: this.board.slice(),
       pot: this.pot(), toCall, myBet: p.bet, stack: p.chips,
       currentBet: this.currentBet, minRaise: this.minRaise,
       minTo: this.currentBet + this.minRaise, maxTo,
       canRaise: maxTo > this.currentBet && others.some(canAct),
-      nOpp: others.length,
-      opponents: others.map(q => ({ name: q.name, stack: q.chips, bet: q.bet, allIn: q.allIn })),
+      nOpp: others.length, aggressor: this.aggressor,
+      opponents: others.map(q => ({ seat: q.seat, name: q.name, stack: q.chips, bet: q.bet, allIn: q.allIn, pos: posOf[q.seat] })),
+      actions: this.actions.map(a => ({ seat: a.seat, street: a.street, type: a.type, to: a.to })),
       history: this.actions.map(a => a.text),
     };
   };
@@ -382,13 +633,15 @@
       const inc = p.bet - this.currentBet;
       if (inc >= this.minRaise) this.minRaise = inc;
       this.currentBet = p.bet;
+      this.aggressor = p.seat;
       for (const q of this.players) if (q !== p) q.acted = false;
       text = (wasBet ? 'bets ' : 'raises to ') + p.bet + (p.allIn ? ' (all-in)' : '');
+      if (this.street === 'preflop') p.pfrHand = true;
     }
     p.acted = true;
     if (this.street === 'preflop' && (dec.action === 'call' || dec.action === 'raise')) p.vpipHand = true;
-    p.lastAction = text[0].toUpperCase() + text.slice(1);
-    this.actions.push({ street: this.street, text: `${p.name} ${text}` });
+    p.lastAction = cap(text);
+    this.log(p, dec.action, text, dec.action === 'raise' ? p.bet : 0);
     return text;
   };
 
@@ -399,20 +652,23 @@
     else if (rev.grade === 'ok') s.ok++;
     else s.mistakes++;
     s.evLost += rev.loss;
-    s.trail.push(rev.grade === 'good' ? 1 : rev.grade === 'ok' ? 0.5 : 0);
+    const pts = rev.grade === 'good' ? 1 : rev.grade === 'ok' ? 0.5 : 0;
+    s.trail.push(pts);
     if (s.trail.length > 400) s.trail.shift();
     if (rev.leak && rev.grade !== 'good') s.leaks[rev.leak] = (s.leaks[rev.leak] || 0) + 1;
+    const cs = s.concepts[rev.concept] || (s.concepts[rev.concept] = { n: 0, pts: 0 });
+    cs.n++; cs.pts += pts;
     if (this.learning && !p.human) {
       for (const [param, delta] of rev.lesson) {
         const [lo, hi] = PARAM_RANGE[param];
-        p.prof[param] = clamp(p.prof[param] + delta, lo, hi);
+        p.prof[param] = clamp(param === 'openMult' ? p.prof[param] * (1 + delta) : p.prof[param] + delta, lo, hi);
       }
       p.prof.noise = Math.max(0.01, p.prof.noise * 0.997); // practice sharpens reads
     }
     const r = {
       id: ++this.reviewSeq, hand: v.hand, street: v.street, seat: p.seat, name: p.name, human: p.human,
-      view: v, decision: dec, actionText: text, rec: adv.rec, eq: adv.eq, required: adv.required,
-      grade: rev.grade, loss: rev.loss, note: rev.note, leak: rev.leak,
+      view: v, decision: dec, actionText: text, rec: adv.rec, accept: adv.accept, recTo: adv.raiseTo,
+      eq: adv.eq, required: adv.required, grade: rev.grade, loss: rev.loss, note: rev.note, leak: rev.leak, concept: rev.concept,
     };
     this.reviews.push(r);
     if (this.reviews.length > 500) this.reviews.shift();
@@ -478,6 +734,7 @@
     for (const p of this.players) {
       p.stats.hands++;
       if (p.vpipHand) p.stats.vpip++;
+      if (p.pfrHand) p.stats.pfr++;
     }
     for (const w of winners) this.players[w.seat].lastAction = `Wins ${w.amount}` + (w.hand ? ` · ${w.hand}` : '');
     this.lastResult = { hand: this.handNo, winners, board: this.board.slice() };
@@ -494,26 +751,34 @@
     return 'act';
   };
 
+  // Hero's current made hand and draws, for the player's own display.
+  function describeHand(hole, board) {
+    if (board.length < 3) return `${handKey(hole)} · top ${pct(handPct(hole))} of starting hands`;
+    const d = draws(hole, board);
+    return categoryName(score(hole.concat(board))) + (d.names.length ? ' + ' + d.names.join(' + ') : '');
+  }
+
   // Compact one-line summary of a decision for an LLM prompt (token-lean by design).
   function viewSummary(r) {
     const v = r.view;
     const cards = a => a.map(cardText).join('') || '-';
-    const opp = v.opponents.map(o => `${o.name} ${o.stack}${o.allIn ? ' all-in' : ''}`).join(', ');
+    const opp = v.opponents.map(o => `${o.name}(${o.pos}) ${o.stack}${o.allIn ? ' all-in' : ''}`).join(', ');
     return [
-      `Hand ${v.hand} ${v.street}`,
-      `hero ${cards(v.hole)}`,
+      `Hand ${v.hand} ${v.street}, blinds ${SB}/${BB}`,
+      `hero ${v.pos} ${cards(v.hole)}`,
       `board ${cards(v.board)}`,
-      `pot ${v.pot}, to call ${v.toCall}, stack ${v.stack}, blinds ${SB}/${BB}`,
-      `${v.nOpp} opp: ${opp}`,
+      `pot ${v.pot}, to call ${v.toCall}, stack ${v.stack}`,
+      `opp: ${opp}`,
       `history: ${v.history.slice(-6).join('; ')}`,
       `decision: ${r.actionText}`,
-      `local estimate: ${pct(r.eq)} equity vs random hands, ${pct(r.required)} needed`,
+      `coach: ${r.grade}, prefers ${r.rec}, equity vs ranges ${pct(r.eq)}`,
     ].join(' | ');
   }
 
   const API = {
-    RANKS, SUIT_GLYPHS, SB, BB, START, CATEGORIES, PROFILES,
-    rankOf, suitOf, cardText, score, categoryName, equity, Coach, Game, viewSummary,
+    RANKS, SUIT_GLYPHS, SB, BB, START, CATEGORIES, PROFILES, CONCEPTS, POS_NAMES, OPEN,
+    rankOf, suitOf, cardText, score, categoryName, equity, handKey, handPct, texture, draws, rangeFor,
+    preflopPlan, postflopPlan, describeHand, Coach, Game, viewSummary,
   };
   if (typeof module !== 'undefined' && module.exports) module.exports = API;
   else root.Poker = API;
