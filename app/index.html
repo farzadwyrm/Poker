@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Poker Coach</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header class="topbar">
+    <h1>Poker Coach</h1>
+    <div class="controls">
+      <button id="btn-run" class="primary">Deal</button>
+      <button id="btn-seat">Take a seat</button>
+      <label class="speed">Speed <input id="speed" type="range" min="0" max="1500" step="50" value="600"></label>
+      <label><input id="show-cards" type="checkbox"> Show bot cards</label>
+      <label><input id="learning" type="checkbox" checked> Bots learn</label>
+      <button id="btn-new">New game</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="play">
+      <div class="table" id="table">
+        <div class="felt">
+          <div class="street" id="street"></div>
+          <div class="board" id="board"></div>
+          <div class="pot" id="pot"></div>
+          <div class="message" id="message"></div>
+        </div>
+      </div>
+
+      <div class="hero" id="hero">
+        <div class="hero-status" id="hero-status"></div>
+        <div class="actions">
+          <button id="act-fold" data-key="F">Fold</button>
+          <button id="act-call" data-key="C">Check</button>
+          <button id="act-raise" class="primary" data-key="R">Raise</button>
+          <button id="act-hint" class="ghost" data-key="H">Hint</button>
+        </div>
+        <div class="raise-row" id="raise-row">
+          <input id="raise-amt" type="range" min="0" max="100" step="5">
+          <input id="raise-num" type="number" min="0" step="5">
+          <div class="presets">
+            <button data-frac="min">Min</button>
+            <button data-frac="0.5">½ pot</button>
+            <button data-frac="0.66">⅔ pot</button>
+            <button data-frac="1">Pot</button>
+            <button data-frac="max">All-in</button>
+          </div>
+        </div>
+        <div class="hint" id="hint" hidden></div>
+        <div class="last-grade" id="last-grade" hidden></div>
+      </div>
+    </section>
+
+    <aside class="side">
+      <nav class="tabs">
+        <button class="tab active" data-tab="coach">Coach</button>
+        <button class="tab" data-tab="drills">Mistakes &amp; drills</button>
+        <button class="tab" data-tab="players">Players</button>
+      </nav>
+
+      <div class="panel" id="tab-coach">
+        <div class="filter">
+          <label><input type="radio" name="feed" value="all" checked> Everyone</label>
+          <label><input type="radio" name="feed" value="me"> Me only</label>
+          <label><input type="radio" name="feed" value="bad"> Mistakes only</label>
+        </div>
+        <ol class="feed" id="feed"></ol>
+      </div>
+
+      <div class="panel" id="tab-drills" hidden>
+        <div class="drill-summary" id="drill-summary"></div>
+        <div class="drill" id="drill"></div>
+        <h3>Your mistakes</h3>
+        <ol class="mistakes" id="mistakes"></ol>
+      </div>
+
+      <div class="panel" id="tab-players" hidden>
+        <div class="players" id="players"></div>
+        <p class="note">The coach uses Monte Carlo equity against ranges read from public actions, plus a one-street EV model (pot odds and fold equity). It sees only the acting player's cards and public table info.</p>
+      </div>
+    </aside>
+  </main>
+
+  <script src="engine.js"></script>
+  <script src="coach.js"></script>
+  <script src="bots.js"></script>
+  <script src="app.js"></script>
+</body>
+</html>
