@@ -18,6 +18,7 @@
   --card: #fbfbf8;
   --red: #d33a3a;
   --black: #1a1a1a;
+  color-scheme: dark;
 }
 
 * { box-sizing: border-box; }
@@ -45,15 +46,17 @@ input[type="number"] { width: 80px; font: inherit; color: var(--text); backgroun
 
 .topbar {
   display: flex; flex-wrap: wrap; gap: 10px 20px; align-items: center; justify-content: space-between;
-  padding: 10px 16px; border-bottom: 1px solid var(--line); background: var(--panel);
+  padding-block: 10px;
+  padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px));
+  border-bottom: 1px solid var(--line); background: var(--panel);
 }
 .topbar h1 { font-size: 18px; margin: 0; letter-spacing: 0.3px; }
 .controls { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: center; color: var(--muted); }
 .controls label { display: flex; align-items: center; gap: 6px; }
 .speed input { width: 100px; }
 
-.layout { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px; padding: 16px; max-width: 1400px; margin: 0 auto; }
-@media (max-width: 980px) { .layout { grid-template-columns: 1fr; padding: 12px; } }
+.layout { display: grid; grid-template-columns: minmax(0, 1fr) 380px; gap: 16px; padding-block: 16px; padding-left: max(16px, env(safe-area-inset-left, 0px)); padding-right: max(16px, env(safe-area-inset-right, 0px)); max-width: 1400px; margin: 0 auto; }
+@media (max-width: 980px) { .layout { grid-template-columns: 1fr; } }
 
 /* ---- Table */
 .table { position: relative; width: 100%; aspect-ratio: 16 / 10; min-height: 340px; }

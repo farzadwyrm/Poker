@@ -348,8 +348,14 @@
     if (!hero.sittingOut && state.paused) setPaused(false);
     render();
   });
-  $('#btn-new').addEventListener('click', () => {
-    if (confirm('Start a new game? Stacks, stats and bot learning reset. Your saved mistakes are kept.')) location.reload();
+  // Two-step confirm in the page itself (some embeds block confirm()).
+  let resetTimer = null;
+  $('#btn-new').addEventListener('click', (e) => {
+    const b = e.currentTarget;
+    if (resetTimer) { clearTimeout(resetTimer); location.reload(); return; }
+    b.textContent = 'Click again to reset';
+    b.title = 'Stacks, stats and bot learning reset. Your saved mistakes are kept.';
+    resetTimer = setTimeout(() => { resetTimer = null; b.textContent = 'New game'; }, 3000);
   });
   $('#speed').addEventListener('input', (e) => { state.speed = 1500 - Number(e.target.value); });
   state.speed = 1500 - Number($('#speed').value);
